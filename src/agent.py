@@ -168,6 +168,7 @@ class SpeakerTranscriber(Agent):
         )
 
     async def on_user_turn_completed(self, _, new_message: llm.ChatMessage):
+        logger.info("🔥 STT TURN COMPLETED TRIGGERED")
         user_transcript = new_message.text_content
 
         logger.info(f"🎙️ RAW TRANSCRIPTION EVENT TRIGGERED")
@@ -244,6 +245,7 @@ class MultiUserTranslationManager:
 
     def on_participant_connected(self, participant: rtc.RemoteParticipant):
         logger.info(f"🟢 PARTICIPANT CONNECTED: {participant.identity}")
+        logger.info(f"🔔 EVENT HIT: {participant.identity}")
 
         logger.info(f"📦 METADATA: {participant.metadata}")
         if (
@@ -391,7 +393,8 @@ async def entrypoint(ctx: JobContext):
     manager.start()
 
     logger.info("🔌 CONNECTING TO LIVEKIT...")
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    # await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    await ctx.connect(auto_subscribe=AutoSubscribe.ALL)
     logger.info("✅ CONNECTED TO LIVEKIT ROOM")
     logger.info(f"🏠 ROOM NAME: {ctx.room.name}")
 
