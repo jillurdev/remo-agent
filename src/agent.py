@@ -387,21 +387,20 @@ class MultiUserTranslationManager:
 async def entrypoint(ctx: JobContext):
     logger.info("🚀 ENTRYPOINT STARTED")
 
-    ctx.room.close_on_disconnect = True
-
     manager = MultiUserTranslationManager(ctx)
     manager.start()
 
-    logger.info("🔌 CONNECTING TO LIVEKIT...")
-    # await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    def on_join(participant):
+        logger.info(f"🔥 JOIN EVENT: {participant.identity}")
+        manager.on_participant_connected(participant)
+
+    ctx.room.on("participant_connected", on_join)
+    ctx.room.on("participant_disconnected", manager.on_participant_disconnected)
+    ctx.room.on("participant_metadata_changed", manager.on_metadata_changed)
+
     await ctx.connect(auto_subscribe=AutoSubscribe.ALL)
-    logger.info("✅ CONNECTED TO LIVEKIT ROOM")
-    logger.info(f"🏠 ROOM NAME: {ctx.room.name}")
 
-    logger.info(f"👥 CURRENT PARTICIPANTS: {list(ctx.room.remote_participants.keys())}")
-
-    for p in ctx.room.remote_participants.values():
-        manager.on_participant_connected(p)
+    logger.info("✅ CONNECTED TO LIVEKIT")
 
     while True:
         await asyncio.sleep(1)
