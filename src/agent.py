@@ -1,6 +1,7 @@
 # ============================================================
 #  agent.py  —  LiveKit Multi-User Transcriber + Translator
-#  Per-participant translation: everyone hears in their own language
+#  Per-participant translation: each user hears in their chosen language
+#  AI Mode is personal — only users who enable it get translation
 # ============================================================
 
 import asyncio
@@ -36,7 +37,6 @@ load_dotenv()
 logger = logging.getLogger("transcriber")
 
 DEFAULT_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"
-DEFAULT_TARGET_LANG = "en"  # everyone hears English by default
 
 
 # ================================================================
@@ -61,112 +61,36 @@ def run_health_server():
 
 
 # ================================================================
-#  SPEAKER TRANSCRIBER
-#  One instance per speaker (remote participant).
-#  Listens to their audio, detects language, transcribes speech,
-#  then notifies the room manager to translate for all listeners.
-# ================================================================
-
-class SpeakerTranscriber(Agent):
-    def __init__(
-        self,
-        *,
-        participant_identity: str,
-        room: rtc.Room,
-        on_transcript,  # callback: (identity, transcript, detected_lang) -> None
-    ):
-        self.participant_identity = participant_identity
-        self.room = room
-        self.on_transcript = on_transcript  # called when speech is recognized
-
-        # Auto language detection — Deepgram detects what language is being spoken
-        self.stt_plugin = deepgram.STT(
-            model="nova-2",
-            detect_language=True,   # auto detect — no need to specify language
-            smart_format=True
-        )
-
-        # TTS is required by Agent base class but we won't use its output directly
-        self.tts_plugin = elevenlabs.TTS(
-            model="eleven_multilingual_v2",
-            voice_id=DEFAULT_VOICE_ID
-        )
-
-        super().__init__(
-            instructions="not-needed",
-            stt=self.stt_plugin,
-            tts=self.tts_plugin
-        )
-
-    async def on_user_turn_completed(self, _, new_message: llm.ChatMessage):
-        """Called when a participant finishes speaking. Fires the transcript callback."""
-        user_transcript = new_message.text_content
-
-        if not user_transcript.strip():
-            raise StopResponse()
-
-        # Try to get detected language from Deepgram response
-        detected_lang = "en"
-        try:
-            if hasattr(new_message, "language") and new_message.language:
-                detected_lang = new_message.language
-        except Exception:
-            pass
-
-        logger.info(
-            f"[{self.participant_identity}] detected_lang={detected_lang} "
-            f"transcript={user_transcript!r}"
-        )
-
-        # Notify the room manager — it will translate for all other participants
-        await self.on_transcript(
-            self.participant_identity,
-            user_transcript,
-            detected_lang
-        )
-
-        raise StopResponse()
-
-
-# ================================================================
 #  LISTENER AUDIO PUBLISHER
-#  One instance per listener (remote participant).
-#  Holds a dedicated audio track for publishing translated speech
-#  to that specific participant.
+#  One per participant — holds their personal audio track.
+#  If target_lang is "no-translate", audio is skipped (original plays).
+#  If target_lang is set, translated audio is published to them.
 # ================================================================
 
 class ListenerAudioPublisher:
-    def __init__(self, participant_identity: str, room: rtc.Room):
+    def __init__(self, participant_identity: str, room: rtc.Room, voice_id: str):
         self.participant_identity = participant_identity
         self.room = room
-        self.target_lang = DEFAULT_TARGET_LANG
-        self.voice_id = DEFAULT_VOICE_ID
+        self.target_lang = "no-translate"
+        self.voice_id = voice_id
 
         self._tts = elevenlabs.TTS(
             model="eleven_multilingual_v2",
             voice_id=self.voice_id
         )
-
         self._audio_source = rtc.AudioSource(
             self._tts.sample_rate,
             self._tts.num_channels
         )
-
         self._track = rtc.LocalAudioTrack.create_audio_track(
             f"translation_{participant_identity}",
             self._audio_source
         )
-
         self._track_published = False
         self._lock = asyncio.Lock()
 
     def update_settings(self, target_lang: str, voice_id: str):
-        """Update target language and voice when participant changes their preference."""
-        changed = False
-
-        if target_lang != self.target_lang:
-            self.target_lang = target_lang
-            changed = True
+        self.target_lang = target_lang
 
         if voice_id != self.voice_id:
             self.voice_id = voice_id
@@ -183,32 +107,23 @@ class ListenerAudioPublisher:
                 self._audio_source
             )
             self._track_published = False
-            changed = True
-
-        return changed
 
     async def speak(self, text: str, from_lang: str):
-        """
-        Translate text from from_lang to this listener's target_lang,
-        then synthesize and publish audio.
-        Skip if same language or no-translate.
-        """
         if not text.strip():
             return
 
         if self.target_lang == "no-translate":
             return
 
-        # Skip translation if already in target language
         if from_lang == self.target_lang:
-            translated_text = text
-        else:
-            try:
-                translator = Translator(to_lang=self.target_lang, from_lang=from_lang)
-                translated_text = translator.translate(text)
-            except Exception as e:
-                logger.error(f"Translation error for {self.participant_identity}: {e}")
-                return
+            return
+
+        try:
+            translator = Translator(to_lang=self.target_lang, from_lang=from_lang)
+            translated_text = translator.translate(text)
+        except Exception as e:
+            logger.error(f"Translation error for {self.participant_identity}: {e}")
+            return
 
         logger.info(
             f"[for {self.participant_identity}] "
@@ -226,17 +141,63 @@ class ListenerAudioPublisher:
                     await self._audio_source.capture_frame(synthesized.frame)
 
             except Exception as e:
-                logger.error(
-                    f"TTS/publish error for {self.participant_identity}: {e}"
-                )
+                logger.error(f"TTS/publish error for {self.participant_identity}: {e}")
+
+
+# ================================================================
+#  SPEAKER TRANSCRIBER
+#  One per speaker — listens to their audio, auto-detects language,
+#  transcribes speech, then notifies manager to translate for listeners.
+# ================================================================
+
+class SpeakerTranscriber(Agent):
+    def __init__(self, *, participant_identity: str, room: rtc.Room, on_transcript):
+        self.participant_identity = participant_identity
+        self.room = room
+        self.on_transcript = on_transcript
+
+        self.stt_plugin = deepgram.STT(
+            model="nova-2",
+            detect_language=True,
+            smart_format=True
+        )
+
+        self.tts_plugin = elevenlabs.TTS(
+            model="eleven_multilingual_v2",
+            voice_id=DEFAULT_VOICE_ID
+        )
+
+        super().__init__(
+            instructions="not-needed",
+            stt=self.stt_plugin,
+            tts=self.tts_plugin
+        )
+
+    async def on_user_turn_completed(self, _, new_message: llm.ChatMessage):
+        user_transcript = new_message.text_content
+
+        if not user_transcript.strip():
+            raise StopResponse()
+
+        detected_lang = "en"
+        try:
+            if hasattr(new_message, "language") and new_message.language:
+                detected_lang = new_message.language
+        except Exception:
+            pass
+
+        logger.info(
+            f"[{self.participant_identity}] detected={detected_lang} "
+            f"transcript={user_transcript!r}"
+        )
+
+        await self.on_transcript(self.participant_identity, user_transcript, detected_lang)
+
+        raise StopResponse()
 
 
 # ================================================================
 #  MULTI-USER TRANSLATION MANAGER
-#  Orchestrates everything:
-#  - One SpeakerTranscriber per speaker
-#  - One ListenerAudioPublisher per listener
-#  - When anyone speaks → translate for all others simultaneously
 # ================================================================
 
 class MultiUserTranslationManager:
@@ -246,8 +207,6 @@ class MultiUserTranslationManager:
         self._speaker_agents: dict[str, SpeakerTranscriber] = {}
         self._listeners: dict[str, ListenerAudioPublisher] = {}
         self._tasks: set[asyncio.Task] = set()
-
-        # Per-participant settings
         self._user_target_lang: dict[str, str] = {}
         self._user_voice: dict[str, str] = {}
 
@@ -266,16 +225,13 @@ class MultiUserTranslationManager:
         )
 
     def _parse_metadata(self, participant: rtc.RemoteParticipant):
-        """Parse participant metadata. Returns (target_lang, voice_id)."""
-        target_lang = DEFAULT_TARGET_LANG
+        target_lang = "no-translate"
         voice_id = DEFAULT_VOICE_ID
 
         if participant.metadata:
             try:
                 metadata = json.loads(participant.metadata)
-                target_lang = metadata.get("target_lang", DEFAULT_TARGET_LANG)
-                if target_lang == "no-translate":
-                    target_lang = DEFAULT_TARGET_LANG
+                target_lang = metadata.get("target_lang", "no-translate")
                 voice_id = metadata.get("voice_id", DEFAULT_VOICE_ID)
             except Exception as e:
                 logger.warning(f"Metadata parse error for {participant.identity}: {e}")
@@ -283,19 +239,15 @@ class MultiUserTranslationManager:
         return target_lang, voice_id
 
     def on_metadata_changed(self, participant: rtc.RemoteParticipant, _):
-        """When participant changes their language preference — update listener settings."""
         target_lang, voice_id = self._parse_metadata(participant)
         self._user_target_lang[participant.identity] = target_lang
         self._user_voice[participant.identity] = voice_id
 
         if participant.identity in self._listeners:
             self._listeners[participant.identity].update_settings(target_lang, voice_id)
-            logger.info(
-                f"Updated listener {participant.identity}: target_lang={target_lang}"
-            )
+            logger.info(f"Updated {participant.identity}: target_lang={target_lang}")
 
     def on_participant_connected(self, participant: rtc.RemoteParticipant):
-        """When a new participant joins — set up speaker transcriber + listener publisher."""
         if (
             participant.identity in self._speaker_sessions
             or participant.identity.startswith("agent-")
@@ -306,12 +258,10 @@ class MultiUserTranslationManager:
         self._user_target_lang[participant.identity] = target_lang
         self._user_voice[participant.identity] = voice_id
 
-        # Create listener publisher for this participant
-        listener = ListenerAudioPublisher(participant.identity, self.ctx.room)
+        listener = ListenerAudioPublisher(participant.identity, self.ctx.room, voice_id)
         listener.update_settings(target_lang, voice_id)
         self._listeners[participant.identity] = listener
 
-        # Start speaker transcriber session
         task = asyncio.create_task(self._start_speaker_session(participant))
         self._tasks.add(task)
 
@@ -328,7 +278,6 @@ class MultiUserTranslationManager:
         task.add_done_callback(on_done)
 
     def on_participant_disconnected(self, participant: rtc.RemoteParticipant):
-        """Clean up all state when participant leaves."""
         self._user_target_lang.pop(participant.identity, None)
         self._user_voice.pop(participant.identity, None)
         self._listeners.pop(participant.identity, None)
@@ -342,18 +291,8 @@ class MultiUserTranslationManager:
         self._tasks.add(task)
         task.add_done_callback(lambda _: self._tasks.discard(task))
 
-    async def on_transcript(
-        self,
-        speaker_identity: str,
-        transcript: str,
-        detected_lang: str
-    ):
-        """
-        Called when a participant finishes speaking.
-        1. Publish raw transcript to all (for subtitle UI)
-        2. Translate + speak for each OTHER participant simultaneously
-        """
-        # --- Publish raw transcript for subtitle display ---
+    async def on_transcript(self, speaker_identity: str, transcript: str, detected_lang: str):
+        # Publish raw transcript for subtitle UI
         raw_identity = speaker_identity
         clean_name = re.sub(r'_{2,}[a-zA-Z0-9]+$', '', raw_identity)
 
@@ -375,29 +314,25 @@ class MultiUserTranslationManager:
                 topic="transcription_data"
             )
         except Exception as e:
-            logger.error(f"Failed to publish transcript data: {e}")
+            logger.error(f"Failed to publish transcript: {e}")
 
-        # --- Translate for all OTHER participants simultaneously ---
+        # Translate only for listeners who have AI mode ON (target_lang != no-translate)
         listeners_to_speak = [
             listener
             for identity, listener in self._listeners.items()
-            if identity != speaker_identity  # don't play back to the speaker
+            if identity != speaker_identity
+            and listener.target_lang != "no-translate"
         ]
 
         if not listeners_to_speak:
             return
 
-        # Run all translations in parallel
         await asyncio.gather(
             *[listener.speak(transcript, detected_lang) for listener in listeners_to_speak],
             return_exceptions=True
         )
 
-    async def _start_speaker_session(
-        self,
-        participant: rtc.RemoteParticipant
-    ):
-        """Create and start a SpeakerTranscriber session for a participant."""
+    async def _start_speaker_session(self, participant: rtc.RemoteParticipant):
         session = AgentSession()
 
         agent = SpeakerTranscriber(
@@ -416,7 +351,7 @@ class MultiUserTranslationManager:
             ),
             output_options=RoomOutputOptions(
                 transcription_enabled=True,
-                audio_enabled=False  # we publish audio manually via ListenerAudioPublisher
+                audio_enabled=False
             ),
         )
 
@@ -441,7 +376,6 @@ async def entrypoint(ctx: JobContext):
 
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
-    # Handle participants already in the room when agent connects
     for p in ctx.room.remote_participants.values():
         manager.on_participant_connected(p)
 
