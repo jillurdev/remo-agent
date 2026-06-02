@@ -106,10 +106,12 @@ class ListenerAudioPublisher:
             self._track_published = False
 
     async def speak(self, text: str):
+        logger.info(f"🔊 SPEECH REQUEST: {self.participant_identity}")
         if not text.strip():
             return
 
         if self.target_lang == "no-translate":
+            logger.info(f"🚫 SKIP (no-translate): {self.participant_identity}")
             return
 
         try:
@@ -168,14 +170,19 @@ class SpeakerTranscriber(Agent):
     async def on_user_turn_completed(self, _, new_message: llm.ChatMessage):
         user_transcript = new_message.text_content
 
+        logger.info(f"🎙️ RAW TRANSCRIPTION EVENT TRIGGERED")
+
         if not user_transcript.strip():
+            logger.info("⚠️ EMPTY TRANSCRIPT")
             raise StopResponse()
 
         logger.info(
-            f"[{self.participant_identity}] transcript={user_transcript!r}"
-        )
+        f"📝 FINAL TRANSCRIPT [{self.participant_identity}]: {user_transcript}"
+    )
 
         await self.on_transcript(self.participant_identity, user_transcript)
+
+        logger.info("📤 TRANSCRIPT SENT TO MANAGER")
 
         raise StopResponse()
 
@@ -198,6 +205,7 @@ class MultiUserTranslationManager:
         self.ctx.room.on("participant_connected", self.on_participant_connected)
         self.ctx.room.on("participant_disconnected", self.on_participant_disconnected)
         self.ctx.room.on("participant_metadata_changed", self.on_metadata_changed)
+        
 
     async def aclose(self):
         self.ctx.room.off("participant_connected", self.on_participant_connected)
@@ -219,6 +227,9 @@ class MultiUserTranslationManager:
                 voice_id = metadata.get("voice_id", DEFAULT_VOICE_ID)
             except Exception as e:
                 logger.warning(f"Metadata parse error for {participant.identity}: {e}")
+                logger.info(
+    f"🔄 METADATA UPDATED: {participant.identity} -> {participant.metadata}"
+)
 
         return target_lang, voice_id
 
@@ -232,11 +243,17 @@ class MultiUserTranslationManager:
             logger.info(f"Updated {participant.identity}: target_lang={target_lang}")
 
     def on_participant_connected(self, participant: rtc.RemoteParticipant):
+        logger.info(f"🟢 PARTICIPANT CONNECTED: {participant.identity}")
+
+        logger.info(f"📦 METADATA: {participant.metadata}")
         if (
             participant.identity in self._speaker_sessions
             or participant.identity.startswith("agent-")
         ):
+            logger.info(f"⛔ SKIPPED PARTICIPANT: {participant.identity}")
             return
+        
+        logger.info(f"🎯 STARTING SPEAKER SESSION FOR: {participant.identity}")
 
         target_lang, voice_id = self._parse_metadata(participant)
         self._user_target_lang[participant.identity] = target_lang
@@ -262,6 +279,7 @@ class MultiUserTranslationManager:
         task.add_done_callback(on_done)
 
     def on_participant_disconnected(self, participant: rtc.RemoteParticipant):
+        logger.info(f"🔴 PARTICIPANT DISCONNECTED: {participant.identity}")
         self._user_target_lang.pop(participant.identity, None)
         self._user_voice.pop(participant.identity, None)
         self._listeners.pop(participant.identity, None)
@@ -276,6 +294,8 @@ class MultiUserTranslationManager:
         task.add_done_callback(lambda _: self._tasks.discard(task))
 
     async def on_transcript(self, speaker_identity: str, transcript: str):
+        logger.info(f"📩 MANAGER RECEIVED TRANSCRIPT FROM: {speaker_identity}")
+        logger.info(f"💬 TEXT: {transcript}")
         raw_identity = speaker_identity
         clean_name = re.sub(r'_{2,}[a-zA-Z0-9]+$', '', raw_identity)
 
@@ -316,6 +336,8 @@ class MultiUserTranslationManager:
         )
 
     async def _start_speaker_session(self, participant: rtc.RemoteParticipant):
+        logger.info(f"⚙️ SESSION CREATION START: {participant.identity}")
+        
         session = AgentSession()
 
         agent = SpeakerTranscriber(
@@ -323,6 +345,8 @@ class MultiUserTranslationManager:
             room=self.ctx.room,
             on_transcript=self.on_transcript,
         )
+
+        logger.info(f"🧠 AGENT CREATED: {participant.identity}")
 
         room_io = RoomIO(
             agent_session=session,
@@ -338,8 +362,15 @@ class MultiUserTranslationManager:
             ),
         )
 
+        logger.info(f"🔗 ROOM IO STARTING: {participant.identity}")
+
         await room_io.start()
+
+        logger.info(f"🎧 ROOM IO STARTED: {participant.identity}")
+
         await session.start(agent=agent)
+
+        logger.info(f"🚀 SESSION STARTED: {participant.identity}")
 
         return session, agent
 
@@ -352,12 +383,19 @@ class MultiUserTranslationManager:
 # ================================================================
 
 async def entrypoint(ctx: JobContext):
+    logger.info("🚀 ENTRYPOINT STARTED")
+
     ctx.room.close_on_disconnect = True
 
     manager = MultiUserTranslationManager(ctx)
     manager.start()
 
+    logger.info("🔌 CONNECTING TO LIVEKIT...")
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    logger.info("✅ CONNECTED TO LIVEKIT ROOM")
+    logger.info(f"🏠 ROOM NAME: {ctx.room.name}")
+
+    logger.info(f"👥 CURRENT PARTICIPANTS: {list(ctx.room.remote_participants.keys())}")
 
     for p in ctx.room.remote_participants.values():
         manager.on_participant_connected(p)
