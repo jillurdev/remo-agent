@@ -62,9 +62,6 @@ def run_health_server():
 
 # ================================================================
 #  LISTENER AUDIO PUBLISHER
-#  One per participant — holds their personal audio track.
-#  If target_lang is "no-translate", audio is skipped (original plays).
-#  If target_lang is set, translated audio is published to them.
 # ================================================================
 
 class ListenerAudioPublisher:
@@ -108,18 +105,15 @@ class ListenerAudioPublisher:
             )
             self._track_published = False
 
-    async def speak(self, text: str, from_lang: str):
+    async def speak(self, text: str):
         if not text.strip():
             return
 
         if self.target_lang == "no-translate":
             return
 
-        if from_lang == self.target_lang:
-            return
-
         try:
-            translator = Translator(to_lang=self.target_lang, from_lang=from_lang)
+            translator = Translator(to_lang=self.target_lang)
             translated_text = translator.translate(text)
         except Exception as e:
             logger.error(f"Translation error for {self.participant_identity}: {e}")
@@ -127,7 +121,7 @@ class ListenerAudioPublisher:
 
         logger.info(
             f"[for {self.participant_identity}] "
-            f"({from_lang}->{self.target_lang}) "
+            f"(auto->{self.target_lang}) "
             f"{text!r} -> {translated_text!r}"
         )
 
@@ -146,8 +140,6 @@ class ListenerAudioPublisher:
 
 # ================================================================
 #  SPEAKER TRANSCRIBER
-#  One per speaker — listens to their audio, auto-detects language,
-#  transcribes speech, then notifies manager to translate for listeners.
 # ================================================================
 
 class SpeakerTranscriber(Agent):
@@ -158,7 +150,7 @@ class SpeakerTranscriber(Agent):
 
         self.stt_plugin = deepgram.STT(
             model="nova-2",
-            detect_language=True,
+            language="multi",
             smart_format=True
         )
 
@@ -179,19 +171,11 @@ class SpeakerTranscriber(Agent):
         if not user_transcript.strip():
             raise StopResponse()
 
-        detected_lang = "en"
-        try:
-            if hasattr(new_message, "language") and new_message.language:
-                detected_lang = new_message.language
-        except Exception:
-            pass
-
         logger.info(
-            f"[{self.participant_identity}] detected={detected_lang} "
-            f"transcript={user_transcript!r}"
+            f"[{self.participant_identity}] transcript={user_transcript!r}"
         )
 
-        await self.on_transcript(self.participant_identity, user_transcript, detected_lang)
+        await self.on_transcript(self.participant_identity, user_transcript)
 
         raise StopResponse()
 
@@ -291,8 +275,7 @@ class MultiUserTranslationManager:
         self._tasks.add(task)
         task.add_done_callback(lambda _: self._tasks.discard(task))
 
-    async def on_transcript(self, speaker_identity: str, transcript: str, detected_lang: str):
-        # Publish raw transcript for subtitle UI
+    async def on_transcript(self, speaker_identity: str, transcript: str):
         raw_identity = speaker_identity
         clean_name = re.sub(r'_{2,}[a-zA-Z0-9]+$', '', raw_identity)
 
@@ -316,7 +299,7 @@ class MultiUserTranslationManager:
         except Exception as e:
             logger.error(f"Failed to publish transcript: {e}")
 
-        # Translate only for listeners who have AI mode ON (target_lang != no-translate)
+        # শুধু যাদের agent mode ON (target_lang != no-translate) তারা translation পাবে
         listeners_to_speak = [
             listener
             for identity, listener in self._listeners.items()
@@ -328,7 +311,7 @@ class MultiUserTranslationManager:
             return
 
         await asyncio.gather(
-            *[listener.speak(transcript, detected_lang) for listener in listeners_to_speak],
+            *[listener.speak(transcript) for listener in listeners_to_speak],
             return_exceptions=True
         )
 
