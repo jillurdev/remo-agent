@@ -103,7 +103,6 @@ class ListenerAudioPublisher:
             return
 
         if self.target_lang == "no-translate":
-            logger.info(f"🚫 SKIP (no-translate): {self.participant_identity}")
             return
 
         try:
@@ -138,14 +137,56 @@ class ListenerAudioPublisher:
 # ================================================================
 
 
+NOVA2_SUPPORTED = {
+    "en",
+    "es",
+    "fr",
+    "de",
+    "hi",
+    "pt",
+    "zh",
+    "ja",
+    "ko",
+    "it",
+    "nl",
+    "pl",
+    "ru",
+    "tr",
+    "id",
+    "vi",
+    "uk",
+    "sv",
+    "no",
+    "da",
+    "fi",
+    "cs",
+    "ro",
+    "bg",
+    "sk",
+    "hu",
+    "el",
+    "ms",
+}
+
+
 class SpeakerTranscriber(Agent):
-    def __init__(self, *, participant_identity: str, room: rtc.Room, on_transcript):
+    def __init__(
+        self,
+        *,
+        participant_identity: str,
+        room: rtc.Room,
+        on_transcript,
+        user_lang: str = "multi",
+    ):
         self.participant_identity = participant_identity
         self.room = room
         self.on_transcript = on_transcript
 
+        stt_lang = user_lang if user_lang in NOVA2_SUPPORTED else "multi"
+        logger.info(f"🎤 STT LANG: {user_lang} -> {stt_lang}")
+
         self.stt_plugin = deepgram.STT(
-            model="nova-2", language="multi", smart_format=True
+            model="nova-2", language=stt_lang, smart_format=True
         )
 
         self.tts_plugin = elevenlabs.TTS(
@@ -183,6 +224,7 @@ class MultiUserTranslationManager:
         self._tasks: set[asyncio.Task] = set()
         self._user_target_lang: dict[str, str] = {}
         self._user_voice: dict[str, str] = {}
+        self._user_lang: dict[str, str] = {}  # speaking language
 
     async def aclose(self):
         await utils.aio.cancel_and_wait(*self._tasks)
@@ -193,25 +235,30 @@ class MultiUserTranslationManager:
     def _parse_metadata(self, participant: rtc.RemoteParticipant):
         target_lang = "no-translate"
         voice_id = DEFAULT_VOICE_ID
+        user_lang = "multi"  # default — auto detect
 
         if participant.metadata:
             try:
                 metadata = json.loads(participant.metadata)
                 target_lang = metadata.get("target_lang", "no-translate")
                 voice_id = metadata.get("voice_id", DEFAULT_VOICE_ID)
+                user_lang = metadata.get("user_lang", "multi")
             except Exception as e:
                 logger.warning(f"Metadata parse error for {participant.identity}: {e}")
 
-        return target_lang, voice_id
+        return target_lang, voice_id, user_lang
 
     def on_metadata_changed(self, participant: rtc.RemoteParticipant, _):
-        target_lang, voice_id = self._parse_metadata(participant)
+        target_lang, voice_id, user_lang = self._parse_metadata(participant)
         self._user_target_lang[participant.identity] = target_lang
         self._user_voice[participant.identity] = voice_id
+        self._user_lang[participant.identity] = user_lang
 
         if participant.identity in self._listeners:
             self._listeners[participant.identity].update_settings(target_lang, voice_id)
-            logger.info(f"🔄 UPDATED {participant.identity}: target_lang={target_lang}")
+            logger.info(
+                f"🔄 UPDATED {participant.identity}: target_lang={target_lang}, user_lang={user_lang}"
+            )
 
     def on_participant_connected(self, participant: rtc.RemoteParticipant):
         logger.info(f"🟢 PARTICIPANT CONNECTED: {participant.identity}")
@@ -223,9 +270,10 @@ class MultiUserTranslationManager:
             logger.info(f"⛔ SKIPPED: {participant.identity}")
             return
 
-        target_lang, voice_id = self._parse_metadata(participant)
+        target_lang, voice_id, user_lang = self._parse_metadata(participant)
         self._user_target_lang[participant.identity] = target_lang
         self._user_voice[participant.identity] = voice_id
+        self._user_lang[participant.identity] = user_lang
 
         listener = ListenerAudioPublisher(participant.identity, self.ctx.room, voice_id)
         listener.update_settings(target_lang, voice_id)
@@ -251,6 +299,7 @@ class MultiUserTranslationManager:
         logger.info(f"🔴 DISCONNECTED: {participant.identity}")
         self._user_target_lang.pop(participant.identity, None)
         self._user_voice.pop(participant.identity, None)
+        self._user_lang.pop(participant.identity, None)
         self._listeners.pop(participant.identity, None)
         self._speaker_agents.pop(participant.identity, None)
 
@@ -322,10 +371,14 @@ class MultiUserTranslationManager:
 
         session = AgentSession()
 
+        user_lang = self._user_lang.get(participant.identity, "multi")
+        logger.info(f"🗣️ USER LANG for {participant.identity}: {user_lang}")
+
         agent = SpeakerTranscriber(
             participant_identity=participant.identity,
             room=self.ctx.room,
             on_transcript=self.on_transcript,
+            user_lang=user_lang,
         )
 
         room_io = RoomIO(
@@ -334,7 +387,6 @@ class MultiUserTranslationManager:
             participant=participant,
             input_options=RoomInputOptions(
                 text_enabled=False,
-                # noise_cancellation=noise_cancellation.BVC()
             ),
             output_options=RoomOutputOptions(
                 transcription_enabled=True, audio_enabled=False
