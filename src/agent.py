@@ -203,9 +203,8 @@ class MultiUserTranslationManager:
         self._user_voice: dict[str, str] = {}
 
     def start(self):
-        self.ctx.room.on("participant_connected", self.on_participant_connected)
-        self.ctx.room.on("participant_disconnected", self.on_participant_disconnected)
-        self.ctx.room.on("participant_metadata_changed", self.on_metadata_changed)
+
+        pass
         
 
     async def aclose(self):
@@ -236,12 +235,14 @@ class MultiUserTranslationManager:
 
     def on_metadata_changed(self, participant: rtc.RemoteParticipant, _):
         target_lang, voice_id = self._parse_metadata(participant)
-        self._user_target_lang[participant.identity] = target_lang
         self._user_voice[participant.identity] = voice_id
 
-        if participant.identity in self._listeners:
-            self._listeners[participant.identity].update_settings(target_lang, voice_id)
-            logger.info(f"Updated {participant.identity}: target_lang={target_lang}")
+        if target_lang != "no-translate":
+            self._user_target_lang[participant.identity] = target_lang
+            if participant.identity in self._listeners:
+                self._listeners[participant.identity].update_settings(target_lang, voice_id)
+                logger.info(f"Updated {participant.identity}: target_lang={target_lang}")
+
 
     def on_participant_connected(self, participant: rtc.RemoteParticipant):
         logger.info(f"🟢 PARTICIPANT CONNECTED: {participant.identity}")
@@ -388,7 +389,7 @@ async def entrypoint(ctx: JobContext):
     logger.info("🚀 ENTRYPOINT STARTED")
 
     manager = MultiUserTranslationManager(ctx)
-    manager.start()
+    # manager.start()
 
     def on_join(participant):
         logger.info(f"🔥 JOIN EVENT: {participant.identity}")
@@ -397,6 +398,7 @@ async def entrypoint(ctx: JobContext):
     ctx.room.on("participant_connected", on_join)
     ctx.room.on("participant_disconnected", manager.on_participant_disconnected)
     ctx.room.on("participant_metadata_changed", manager.on_metadata_changed)
+    ctx.room.on("data_received", on_data_received)
 
     async def _handle_language_update(payload: bytes):
         try:
