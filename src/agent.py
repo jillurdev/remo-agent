@@ -362,10 +362,15 @@ async def entrypoint(ctx: JobContext):
 
     manager = MultiUserTranslationManager(ctx)
 
-    def on_data_received(payload: bytes, participant, kind, topic: str = ""):
-        if topic != "language_update":
-            return
-        asyncio.create_task(manager.handle_language_update(payload))
+    def on_data_received(data_packet):
+        try:
+            topic = data_packet.topic
+            payload = bytes(data_packet.data)
+            if topic != "language_update":
+                return
+            asyncio.create_task(manager.handle_language_update(payload))
+        except Exception as e:
+            logger.error(f"data_received error: {e}")
 
     ctx.room.on("participant_connected", manager.on_participant_connected)
     ctx.room.on("participant_disconnected", manager.on_participant_disconnected)
