@@ -398,14 +398,32 @@ async def entrypoint(ctx: JobContext):
     ctx.room.on("participant_disconnected", manager.on_participant_disconnected)
     ctx.room.on("participant_metadata_changed", manager.on_metadata_changed)
 
+    async def on_data_received(payload: bytes, participant, kind, topic: str = ""):
+        if topic != "language_update":
+            return
+        try:
+            data = json.loads(payload.decode("utf-8"))
+            identity = data.get("identity")
+            target_lang = data.get("target_lang", "no-translate")
+            voice_id = data.get("voice_id", DEFAULT_VOICE_ID)
+            
+            logger.info(f"🌐 LANGUAGE UPDATE: {identity} -> {target_lang}")
+            
+            if identity in manager._listeners:
+                manager._listeners[identity].update_settings(target_lang, voice_id)
+                manager._user_target_lang[identity] = target_lang
+        except Exception as e:
+            logger.error(f"Language update error: {e}")
+
+    ctx.room.on("data_received", on_data_received)
+
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
     logger.info("✅ CONNECTED TO LIVEKIT")
 
     while True:
         await asyncio.sleep(1)
-
-
+        
 # ================================================================
 #  MAIN
 # ================================================================
