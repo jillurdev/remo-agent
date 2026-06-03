@@ -398,7 +398,7 @@ async def entrypoint(ctx: JobContext):
     ctx.room.on("participant_disconnected", manager.on_participant_disconnected)
     ctx.room.on("participant_metadata_changed", manager.on_metadata_changed)
 
-    await ctx.connect(auto_subscribe=AutoSubscribe.ALL)
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
     logger.info("✅ CONNECTED TO LIVEKIT")
 
