@@ -27,7 +27,7 @@ from livekit.agents import (
     llm,
     utils,
 )
-from livekit.plugins import deepgram, elevenlabs, noise_cancellation
+from livekit.plugins import deepgram, elevenlabs
 from translate import Translator
 
 load_dotenv()
@@ -343,7 +343,7 @@ class MultiUserTranslationManager:
             participant=participant,
             input_options=RoomInputOptions(
                 text_enabled=False,
-                noise_cancellation=noise_cancellation.BVC()
+                # noise_cancellation=noise_cancellation.BVC()
             ),
             output_options=RoomOutputOptions(
                 transcription_enabled=True,
