@@ -533,4 +533,4 @@ async def entrypoint(ctx: JobContext):
 
 if __name__ == "__main__":
     threading.Thread(target=run_health_server, daemon=True).start()
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, max_concurrent_jobs=1))
