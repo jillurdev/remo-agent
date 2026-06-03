@@ -105,6 +105,13 @@ class ListenerAudioPublisher:
             self._track_published = False
 
     async def speak(self, text: str):
+        eleven_key = os.environ.get("ELEVEN_API_KEY") or os.environ.get(
+            "ELEVENLABS_API_KEY"
+        )
+        logger.info(
+            f"🔑 TTS KEY AT SPEAK TIME: {'SET' if eleven_key else 'NOT SET'} — first 8 chars: {eleven_key[:8] if eleven_key else 'NONE'}"
+        )
+
         if not text.strip():
             return
 

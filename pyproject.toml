@@ -37,6 +37,7 @@ dependencies = [
     "livekit-blingfire==1.1.0",
     "livekit-plugins-deepgram==1.2.18",
     "livekit-plugins-elevenlabs==1.2.18",
+    "gTTS==2.5.1",
     "livekit-plugins-noise-cancellation>=0.2.5",
     "livekit-protocol==1.1.1",
     "lxml==6.0.2",
