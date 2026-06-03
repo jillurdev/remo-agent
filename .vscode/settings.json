@@ -1,0 +1,40 @@
+{
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "editor.formatOnSave": true,
+  "[javascript]": {
+    "editor.formatOnSave": false,
+    "editor.defaultFormatter": null
+  },
+  "[javascriptreact]": {
+    "editor.formatOnSave": false,
+    "editor.defaultFormatter": null
+  },
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "explicit",
+    "source.fixAll.tslint": "explicit",
+    "source.addMissingImports": "always"
+  },
+  "eslint.validate": ["typescript", "javascript"],
+
+  // emmet
+  "emmet.triggerExpansionOnTab": true,
+  "emmet.includeLanguages": {
+    "javascript": "javascriptreact",
+    "typescript": "typescriptreact"
+  },
+  "cSpell.words": ["fsin", "nosql", "Pilla"],
+  "turboConsoleLog.logMessagePrefix": "🌼",
+  "turboConsoleLog.logMessageSuffix": "🌼",
+
+  "turboConsoleLog.insertEmptyLineAfterLogMessage": true,
+
+  "turboConsoleLog.insertEnclosingClass": true,
+  "turboConsoleLog.delimiterInsideMessage": "🔥🔥",
+  "turboConsoleLog.quote": "'",
+  "turboConsoleLog.addSemicolonInTheEnd": true,
+
+  
+  "[typescriptreact]": {
+    "editor.defaultFormatter": "vscode.typescript-language-features"
+  }
+}

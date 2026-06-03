@@ -28,7 +28,7 @@ from livekit.agents import (
     utils,
 )
 from livekit.plugins import deepgram, elevenlabs
-from translate import Translator
+from deep_translator import GoogleTranslator
 
 load_dotenv()
 
@@ -40,6 +40,7 @@ DEFAULT_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"
 # ================================================================
 #  HEALTH CHECK SERVER
 # ================================================================
+
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -62,6 +63,7 @@ def run_health_server():
 #  LISTENER AUDIO PUBLISHER
 # ================================================================
 
+
 class ListenerAudioPublisher:
     def __init__(self, participant_identity: str, room: rtc.Room, voice_id: str):
         self.participant_identity = participant_identity
@@ -70,16 +72,13 @@ class ListenerAudioPublisher:
         self.voice_id = voice_id
 
         self._tts = elevenlabs.TTS(
-            model="eleven_multilingual_v2",
-            voice_id=self.voice_id
+            model="eleven_multilingual_v2", voice_id=self.voice_id
         )
         self._audio_source = rtc.AudioSource(
-            self._tts.sample_rate,
-            self._tts.num_channels
+            self._tts.sample_rate, self._tts.num_channels
         )
         self._track = rtc.LocalAudioTrack.create_audio_track(
-            f"translation_{participant_identity}",
-            self._audio_source
+            f"translation_{participant_identity}", self._audio_source
         )
         self._track_published = False
         self._lock = asyncio.Lock()
@@ -89,16 +88,13 @@ class ListenerAudioPublisher:
         if voice_id != self.voice_id:
             self.voice_id = voice_id
             self._tts = elevenlabs.TTS(
-                model="eleven_multilingual_v2",
-                voice_id=self.voice_id
+                model="eleven_multilingual_v2", voice_id=self.voice_id
             )
             self._audio_source = rtc.AudioSource(
-                self._tts.sample_rate,
-                self._tts.num_channels
+                self._tts.sample_rate, self._tts.num_channels
             )
             self._track = rtc.LocalAudioTrack.create_audio_track(
-                f"translation_{self.participant_identity}",
-                self._audio_source
+                f"translation_{self.participant_identity}", self._audio_source
             )
             self._track_published = False
 
@@ -111,8 +107,9 @@ class ListenerAudioPublisher:
             return
 
         try:
-            translator = Translator(to_lang=self.target_lang)
-            translated_text = translator.translate(text)
+            translated_text = GoogleTranslator(
+                source="auto", target=self.target_lang
+            ).translate(text)
         except Exception as e:
             logger.error(f"Translation error for {self.participant_identity}: {e}")
             return
@@ -140,6 +137,7 @@ class ListenerAudioPublisher:
 #  SPEAKER TRANSCRIBER
 # ================================================================
 
+
 class SpeakerTranscriber(Agent):
     def __init__(self, *, participant_identity: str, room: rtc.Room, on_transcript):
         self.participant_identity = participant_identity
@@ -147,20 +145,15 @@ class SpeakerTranscriber(Agent):
         self.on_transcript = on_transcript
 
         self.stt_plugin = deepgram.STT(
-            model="nova-2",
-            language="multi",
-            smart_format=True
+            model="nova-2", language="multi", smart_format=True
         )
 
         self.tts_plugin = elevenlabs.TTS(
-            model="eleven_multilingual_v2",
-            voice_id=DEFAULT_VOICE_ID
+            model="eleven_multilingual_v2", voice_id=DEFAULT_VOICE_ID
         )
 
         super().__init__(
-            instructions="not-needed",
-            stt=self.stt_plugin,
-            tts=self.tts_plugin
+            instructions="not-needed", stt=self.stt_plugin, tts=self.tts_plugin
         )
 
     async def on_user_turn_completed(self, _, new_message: llm.ChatMessage):
@@ -179,6 +172,7 @@ class SpeakerTranscriber(Agent):
 # ================================================================
 #  MULTI-USER TRANSLATION MANAGER
 # ================================================================
+
 
 class MultiUserTranslationManager:
     def __init__(self, ctx: JobContext):
@@ -287,24 +281,20 @@ class MultiUserTranslationManager:
         logger.info(f"📩 TRANSCRIPT FROM: {speaker_identity} — {transcript!r}")
 
         raw_identity = speaker_identity
-        clean_name = re.sub(r'_{2,}[a-zA-Z0-9]+$', '', raw_identity)
+        clean_name = re.sub(r"_{2,}[a-zA-Z0-9]+$", "", raw_identity)
 
         payload = {
             "message": transcript,
             "timestamp": int(time.time() * 1000),
             "id": f"transcript-{raw_identity}-{time.time()}",
-            "from": {
-                "identity": raw_identity,
-                "name": clean_name,
-                "isLocal": False
-            }
+            "from": {"identity": raw_identity, "name": clean_name, "isLocal": False},
         }
 
         try:
             await self.ctx.room.local_participant.publish_data(
                 payload=json.dumps(payload).encode("utf-8"),
                 reliable=True,
-                topic="transcription_data"
+                topic="transcription_data",
             )
         except Exception as e:
             logger.error(f"Failed to publish transcript: {e}")
@@ -312,18 +302,19 @@ class MultiUserTranslationManager:
         listeners_to_speak = [
             listener
             for identity, listener in self._listeners.items()
-            if identity != speaker_identity
-            and listener.target_lang != "no-translate"
+            if identity != speaker_identity and listener.target_lang != "no-translate"
         ]
 
-        logger.info(f"🔊 LISTENERS TO SPEAK: {[l.participant_identity for l in listeners_to_speak]}")
+        logger.info(
+            f"🔊 LISTENERS TO SPEAK: {[l.participant_identity for l in listeners_to_speak]}"
+        )
 
         if not listeners_to_speak:
             return
 
         await asyncio.gather(
             *[listener.speak(transcript) for listener in listeners_to_speak],
-            return_exceptions=True
+            return_exceptions=True,
         )
 
     async def _start_speaker_session(self, participant: rtc.RemoteParticipant):
@@ -346,8 +337,7 @@ class MultiUserTranslationManager:
                 # noise_cancellation=noise_cancellation.BVC()
             ),
             output_options=RoomOutputOptions(
-                transcription_enabled=True,
-                audio_enabled=False
+                transcription_enabled=True, audio_enabled=False
             ),
         )
 
@@ -365,6 +355,7 @@ class MultiUserTranslationManager:
 # ================================================================
 #  ENTRYPOINT
 # ================================================================
+
 
 async def entrypoint(ctx: JobContext):
     logger.info("🚀 ENTRYPOINT STARTED")
