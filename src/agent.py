@@ -1,7 +1,5 @@
 # ============================================================
 #  agent.py  —  LiveKit Multi-User Transcriber + Translator
-#  Per-participant translation: each user hears in their chosen language
-#  AI Mode is personal — only users who enable it get translation
 # ============================================================
 
 import asyncio
@@ -40,7 +38,7 @@ DEFAULT_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"
 
 
 # ================================================================
-#  HEALTH CHECK SERVER (required for Render)
+#  HEALTH CHECK SERVER
 # ================================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -88,7 +86,6 @@ class ListenerAudioPublisher:
 
     def update_settings(self, target_lang: str, voice_id: str):
         self.target_lang = target_lang
-
         if voice_id != self.voice_id:
             self.voice_id = voice_id
             self._tts = elevenlabs.TTS(
@@ -106,7 +103,6 @@ class ListenerAudioPublisher:
             self._track_published = False
 
     async def speak(self, text: str):
-        logger.info(f"🔊 SPEECH REQUEST: {self.participant_identity}")
         if not text.strip():
             return
 
@@ -168,22 +164,14 @@ class SpeakerTranscriber(Agent):
         )
 
     async def on_user_turn_completed(self, _, new_message: llm.ChatMessage):
-        logger.info("🔥 STT TURN COMPLETED TRIGGERED")
         user_transcript = new_message.text_content
 
-        logger.info(f"🎙️ RAW TRANSCRIPTION EVENT TRIGGERED")
-
         if not user_transcript.strip():
-            logger.info("⚠️ EMPTY TRANSCRIPT")
             raise StopResponse()
 
-        logger.info(
-        f"📝 FINAL TRANSCRIPT [{self.participant_identity}]: {user_transcript}"
-    )
+        logger.info(f"📝 TRANSCRIPT [{self.participant_identity}]: {user_transcript!r}")
 
         await self.on_transcript(self.participant_identity, user_transcript)
-
-        logger.info("📤 TRANSCRIPT SENT TO MANAGER")
 
         raise StopResponse()
 
@@ -202,15 +190,7 @@ class MultiUserTranslationManager:
         self._user_target_lang: dict[str, str] = {}
         self._user_voice: dict[str, str] = {}
 
-    def start(self):
-
-        pass
-        
-
     async def aclose(self):
-        self.ctx.room.off("participant_connected", self.on_participant_connected)
-        self.ctx.room.off("participant_disconnected", self.on_participant_disconnected)
-        self.ctx.room.off("participant_metadata_changed", self.on_metadata_changed)
         await utils.aio.cancel_and_wait(*self._tasks)
         await asyncio.gather(
             *[self._close_session(s) for s in self._speaker_sessions.values()]
@@ -227,36 +207,27 @@ class MultiUserTranslationManager:
                 voice_id = metadata.get("voice_id", DEFAULT_VOICE_ID)
             except Exception as e:
                 logger.warning(f"Metadata parse error for {participant.identity}: {e}")
-                logger.info(
-    f"🔄 METADATA UPDATED: {participant.identity} -> {participant.metadata}"
-)
 
         return target_lang, voice_id
 
     def on_metadata_changed(self, participant: rtc.RemoteParticipant, _):
         target_lang, voice_id = self._parse_metadata(participant)
+        self._user_target_lang[participant.identity] = target_lang
         self._user_voice[participant.identity] = voice_id
 
-        if target_lang != "no-translate":
-            self._user_target_lang[participant.identity] = target_lang
-            if participant.identity in self._listeners:
-                self._listeners[participant.identity].update_settings(target_lang, voice_id)
-                logger.info(f"Updated {participant.identity}: target_lang={target_lang}")
-
+        if participant.identity in self._listeners:
+            self._listeners[participant.identity].update_settings(target_lang, voice_id)
+            logger.info(f"🔄 UPDATED {participant.identity}: target_lang={target_lang}")
 
     def on_participant_connected(self, participant: rtc.RemoteParticipant):
         logger.info(f"🟢 PARTICIPANT CONNECTED: {participant.identity}")
-        logger.info(f"🔔 EVENT HIT: {participant.identity}")
 
-        logger.info(f"📦 METADATA: {participant.metadata}")
         if (
             participant.identity in self._speaker_sessions
             or participant.identity.startswith("agent-")
         ):
-            logger.info(f"⛔ SKIPPED PARTICIPANT: {participant.identity}")
+            logger.info(f"⛔ SKIPPED: {participant.identity}")
             return
-        
-        logger.info(f"🎯 STARTING SPEAKER SESSION FOR: {participant.identity}")
 
         target_lang, voice_id = self._parse_metadata(participant)
         self._user_target_lang[participant.identity] = target_lang
@@ -274,6 +245,7 @@ class MultiUserTranslationManager:
                 session, agent = t.result()
                 self._speaker_sessions[participant.identity] = session
                 self._speaker_agents[participant.identity] = agent
+                logger.info(f"✅ SESSION READY: {participant.identity}")
             except Exception as e:
                 logger.error(f"Session failed for {participant.identity}: {e}")
             finally:
@@ -282,7 +254,7 @@ class MultiUserTranslationManager:
         task.add_done_callback(on_done)
 
     def on_participant_disconnected(self, participant: rtc.RemoteParticipant):
-        logger.info(f"🔴 PARTICIPANT DISCONNECTED: {participant.identity}")
+        logger.info(f"🔴 DISCONNECTED: {participant.identity}")
         self._user_target_lang.pop(participant.identity, None)
         self._user_voice.pop(participant.identity, None)
         self._listeners.pop(participant.identity, None)
@@ -296,9 +268,24 @@ class MultiUserTranslationManager:
         self._tasks.add(task)
         task.add_done_callback(lambda _: self._tasks.discard(task))
 
+    async def handle_language_update(self, payload: bytes):
+        try:
+            data = json.loads(payload.decode("utf-8"))
+            identity = data.get("identity")
+            target_lang = data.get("target_lang", "no-translate")
+            voice_id = data.get("voice_id", DEFAULT_VOICE_ID)
+
+            logger.info(f"🌐 LANGUAGE UPDATE: {identity} -> {target_lang}")
+
+            if identity in self._listeners:
+                self._listeners[identity].update_settings(target_lang, voice_id)
+                self._user_target_lang[identity] = target_lang
+        except Exception as e:
+            logger.error(f"Language update error: {e}")
+
     async def on_transcript(self, speaker_identity: str, transcript: str):
-        logger.info(f"📩 MANAGER RECEIVED TRANSCRIPT FROM: {speaker_identity}")
-        logger.info(f"💬 TEXT: {transcript}")
+        logger.info(f"📩 TRANSCRIPT FROM: {speaker_identity} — {transcript!r}")
+
         raw_identity = speaker_identity
         clean_name = re.sub(r'_{2,}[a-zA-Z0-9]+$', '', raw_identity)
 
@@ -322,13 +309,14 @@ class MultiUserTranslationManager:
         except Exception as e:
             logger.error(f"Failed to publish transcript: {e}")
 
-        # শুধু যাদের agent mode ON (target_lang != no-translate) তারা translation পাবে
         listeners_to_speak = [
             listener
             for identity, listener in self._listeners.items()
             if identity != speaker_identity
             and listener.target_lang != "no-translate"
         ]
+
+        logger.info(f"🔊 LISTENERS TO SPEAK: {[l.participant_identity for l in listeners_to_speak]}")
 
         if not listeners_to_speak:
             return
@@ -339,8 +327,8 @@ class MultiUserTranslationManager:
         )
 
     async def _start_speaker_session(self, participant: rtc.RemoteParticipant):
-        logger.info(f"⚙️ SESSION CREATION START: {participant.identity}")
-        
+        logger.info(f"⚙️ STARTING SESSION: {participant.identity}")
+
         session = AgentSession()
 
         agent = SpeakerTranscriber(
@@ -348,8 +336,6 @@ class MultiUserTranslationManager:
             room=self.ctx.room,
             on_transcript=self.on_transcript,
         )
-
-        logger.info(f"🧠 AGENT CREATED: {participant.identity}")
 
         room_io = RoomIO(
             agent_session=session,
@@ -365,15 +351,10 @@ class MultiUserTranslationManager:
             ),
         )
 
-        logger.info(f"🔗 ROOM IO STARTING: {participant.identity}")
-
         await room_io.start()
-
-        logger.info(f"🎧 ROOM IO STARTED: {participant.identity}")
-
         await session.start(agent=agent)
 
-        logger.info(f"🚀 SESSION STARTED: {participant.identity}")
+        logger.info(f"🚀 SESSION LIVE: {participant.identity}")
 
         return session, agent
 
@@ -389,37 +370,15 @@ async def entrypoint(ctx: JobContext):
     logger.info("🚀 ENTRYPOINT STARTED")
 
     manager = MultiUserTranslationManager(ctx)
-    # manager.start()
-
-    def on_join(participant):
-        logger.info(f"🔥 JOIN EVENT: {participant.identity}")
-        manager.on_participant_connected(participant)
-
-    ctx.room.on("participant_connected", on_join)
-    ctx.room.on("participant_disconnected", manager.on_participant_disconnected)
-    ctx.room.on("participant_metadata_changed", manager.on_metadata_changed)
-    ctx.room.on("data_received", on_data_received)
-
-    async def _handle_language_update(payload: bytes):
-        try:
-            data = json.loads(payload.decode("utf-8"))
-            identity = data.get("identity")
-            target_lang = data.get("target_lang", "no-translate")
-            voice_id = data.get("voice_id", DEFAULT_VOICE_ID)
-            
-            logger.info(f"🌐 LANGUAGE UPDATE: {identity} -> {target_lang}")
-            
-            if identity in manager._listeners:
-                manager._listeners[identity].update_settings(target_lang, voice_id)
-                manager._user_target_lang[identity] = target_lang
-        except Exception as e:
-            logger.error(f"Language update error: {e}")
 
     def on_data_received(payload: bytes, participant, kind, topic: str = ""):
         if topic != "language_update":
             return
-        asyncio.create_task(_handle_language_update(payload))
+        asyncio.create_task(manager.handle_language_update(payload))
 
+    ctx.room.on("participant_connected", manager.on_participant_connected)
+    ctx.room.on("participant_disconnected", manager.on_participant_disconnected)
+    ctx.room.on("participant_metadata_changed", manager.on_metadata_changed)
     ctx.room.on("data_received", on_data_received)
 
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
@@ -431,7 +390,8 @@ async def entrypoint(ctx: JobContext):
 
     while True:
         await asyncio.sleep(1)
-        
+
+
 # ================================================================
 #  MAIN
 # ================================================================
