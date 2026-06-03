@@ -72,7 +72,10 @@ class ListenerAudioPublisher:
         self.voice_id = voice_id
 
         self._tts = elevenlabs.TTS(
-            model="eleven_multilingual_v2", voice_id=self.voice_id
+            model="eleven_multilingual_v2",
+            voice_id=self.voice_id,
+            api_key=os.environ.get("ELEVEN_API_KEY")
+            or os.environ.get("ELEVENLABS_API_KEY"),
         )
         self._audio_source = rtc.AudioSource(
             self._tts.sample_rate, self._tts.num_channels
@@ -88,7 +91,10 @@ class ListenerAudioPublisher:
         if voice_id != self.voice_id:
             self.voice_id = voice_id
             self._tts = elevenlabs.TTS(
-                model="eleven_multilingual_v2", voice_id=self.voice_id
+                model="eleven_multilingual_v2",
+                voice_id=self.voice_id,
+                api_key=os.environ.get("ELEVEN_API_KEY")
+                or os.environ.get("ELEVENLABS_API_KEY"),
             )
             self._audio_source = rtc.AudioSource(
                 self._tts.sample_rate, self._tts.num_channels
@@ -190,7 +196,10 @@ class SpeakerTranscriber(Agent):
         )
 
         self.tts_plugin = elevenlabs.TTS(
-            model="eleven_multilingual_v2", voice_id=DEFAULT_VOICE_ID
+            model="eleven_multilingual_v2",
+            voice_id=DEFAULT_VOICE_ID,
+            api_key=os.environ.get("ELEVEN_API_KEY")
+            or os.environ.get("ELEVENLABS_API_KEY"),
         )
 
         super().__init__(
@@ -410,7 +419,6 @@ class MultiUserTranslationManager:
 
 
 async def entrypoint(ctx: JobContext):
-    logger.info(f"🔑 ELEVEN_API_KEY: {repr(os.environ.get('ELEVEN_API_KEY'))}")
     logger.info("🚀 ENTRYPOINT STARTED")
 
     manager = MultiUserTranslationManager(ctx)
