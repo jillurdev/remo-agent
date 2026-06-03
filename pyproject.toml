@@ -66,6 +66,7 @@ dependencies = [
     "sounddevice==0.5.3",
     "tqdm==4.67.1",
     "translate==3.8.0",
+    "deep-translator==1.11.4",
     "types-protobuf==6.32.1.20251210",
     "typing-extensions==4.15.0",
     "typing-inspection==0.4.2",
