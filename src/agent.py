@@ -27,10 +27,9 @@ from livekit.agents import (
     llm,
     utils,
 )
-# from livekit.plugins import deepgram, elevenlabs
 from livekit.plugins import deepgram
 from deep_translator import GoogleTranslator
-from gtts import gTTS
+import edge_tts
 import io
 import av as pyav
 import numpy as np
@@ -68,6 +67,7 @@ def run_health_server():
 #  LISTENER AUDIO PUBLISHER
 # ================================================================
 
+
 class ListenerAudioPublisher:
     def __init__(self, participant_identity: str, room: rtc.Room, voice_id: str):
         self.participant_identity = participant_identity
@@ -86,7 +86,28 @@ class ListenerAudioPublisher:
         self.target_lang = target_lang
         self.voice_id = voice_id
 
-    
+    def _get_edge_voice(self, lang: str) -> str:
+        voice_map = {
+            "hi": "hi-IN-SwaraNeural",
+            "bn": "bn-IN-TanishaaNeural",
+            "en": "en-US-JennyNeural",
+            "ar": "ar-SA-ZariyahNeural",
+            "fr": "fr-FR-DeniseNeural",
+            "de": "de-DE-KatjaNeural",
+            "es": "es-ES-ElviraNeural",
+            "zh": "zh-CN-XiaoxiaoNeural",
+            "ja": "ja-JP-NanamiNeural",
+            "ko": "ko-KR-SunHiNeural",
+            "ru": "ru-RU-SvetlanaNeural",
+            "pt": "pt-BR-FranciscaNeural",
+            "tr": "tr-TR-EmelNeural",
+            "it": "it-IT-ElsaNeural",
+            "id": "id-ID-GadisNeural",
+            "vi": "vi-VN-HoaiMyNeural",
+        }
+        code = lang[:2].lower()
+        return voice_map.get(code, "en-US-JennyNeural")
+
     async def speak(self, text: str):
         if not text.strip():
             return
@@ -121,9 +142,14 @@ class ListenerAudioPublisher:
                     await self.room.local_participant.publish_track(self._track)
                     self._track_published = True
 
-                tts = gTTS(text=translated_text, lang=self.target_lang[:2], slow=False)
+                # edge-tts দিয়ে audio generate করো
+                voice = self._get_edge_voice(self.target_lang)
+                communicate = edge_tts.Communicate(translated_text, voice)
+
                 mp3_buffer = io.BytesIO()
-                tts.write_to_fp(mp3_buffer)
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "audio":
+                        mp3_buffer.write(chunk["data"])
                 mp3_buffer.seek(0)
 
                 container = pyav.open(mp3_buffer, format="mp3")
@@ -142,6 +168,7 @@ class ListenerAudioPublisher:
 
             except Exception as e:
                 logger.error(f"TTS/publish error for {self.participant_identity}: {e}")
+
 
 # ================================================================
 #  SPEAKER TRANSCRIBER
@@ -200,17 +227,10 @@ class SpeakerTranscriber(Agent):
             model="nova-2", language=stt_lang, smart_format=True
         )
 
-        # self.tts_plugin = elevenlabs.TTS(
-        #     model="eleven_multilingual_v2",
-        #     voice_id=DEFAULT_VOICE_ID,
-        #     api_key=os.environ.get("ELEVEN_API_KEY")
-        #     or os.environ.get("ELEVENLABS_API_KEY"),
-        # )
-
         super().__init__(
             instructions="not-needed",
             stt=self.stt_plugin,
-            tts=None,  
+            tts=None,  # gTTS/ElevenLabs লাগবে না, edge-tts use করছি
         )
 
     async def on_user_turn_completed(self, _, new_message: llm.ChatMessage):
@@ -240,7 +260,7 @@ class MultiUserTranslationManager:
         self._tasks: set[asyncio.Task] = set()
         self._user_target_lang: dict[str, str] = {}
         self._user_voice: dict[str, str] = {}
-        self._user_lang: dict[str, str] = {}  # speaking language
+        self._user_lang: dict[str, str] = {}
 
     async def aclose(self):
         await utils.aio.cancel_and_wait(*self._tasks)
@@ -251,7 +271,7 @@ class MultiUserTranslationManager:
     def _parse_metadata(self, participant: rtc.RemoteParticipant):
         target_lang = "no-translate"
         voice_id = DEFAULT_VOICE_ID
-        user_lang = "multi"  # default — auto detect
+        user_lang = "multi"
 
         if participant.metadata:
             try:
@@ -462,9 +482,4 @@ async def entrypoint(ctx: JobContext):
 
 if __name__ == "__main__":
     threading.Thread(target=run_health_server, daemon=True).start()
-    cli.run_app(
-        WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            load_threshold=0.9, 
-        )
-    )
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
