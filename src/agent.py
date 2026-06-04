@@ -27,7 +27,8 @@ from livekit.agents import (
     llm,
     utils,
 )
-from livekit.plugins import deepgram, elevenlabs
+# from livekit.plugins import deepgram, elevenlabs
+from livekit.plugins import deepgram
 from deep_translator import GoogleTranslator
 from gtts import gTTS
 import io
@@ -199,15 +200,17 @@ class SpeakerTranscriber(Agent):
             model="nova-2", language=stt_lang, smart_format=True
         )
 
-        self.tts_plugin = elevenlabs.TTS(
-            model="eleven_multilingual_v2",
-            voice_id=DEFAULT_VOICE_ID,
-            api_key=os.environ.get("ELEVEN_API_KEY")
-            or os.environ.get("ELEVENLABS_API_KEY"),
-        )
+        # self.tts_plugin = elevenlabs.TTS(
+        #     model="eleven_multilingual_v2",
+        #     voice_id=DEFAULT_VOICE_ID,
+        #     api_key=os.environ.get("ELEVEN_API_KEY")
+        #     or os.environ.get("ELEVENLABS_API_KEY"),
+        # )
 
         super().__init__(
-            instructions="not-needed", stt=self.stt_plugin, tts=self.tts_plugin
+            instructions="not-needed",
+            stt=self.stt_plugin,
+            tts=None,  
         )
 
     async def on_user_turn_completed(self, _, new_message: llm.ChatMessage):
