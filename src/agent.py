@@ -67,88 +67,6 @@ def run_health_server():
 #  LISTENER AUDIO PUBLISHER
 # ================================================================
 
-
-# class ListenerAudioPublisher:
-#     def __init__(self, participant_identity: str, room: rtc.Room, voice_id: str):
-#         self.participant_identity = participant_identity
-#         self.room = room
-#         self.target_lang = "no-translate"
-#         self.voice_id = voice_id
-
-#         self._tts = elevenlabs.TTS(
-#             model="eleven_multilingual_v2",
-#             voice_id=self.voice_id,
-#             api_key=os.environ.get("ELEVEN_API_KEY")
-#             or os.environ.get("ELEVENLABS_API_KEY"),
-#         )
-#         self._audio_source = rtc.AudioSource(
-#             self._tts.sample_rate, self._tts.num_channels
-#         )
-#         self._track = rtc.LocalAudioTrack.create_audio_track(
-#             f"translation_{participant_identity}", self._audio_source
-#         )
-#         self._track_published = False
-#         self._lock = asyncio.Lock()
-
-#     def update_settings(self, target_lang: str, voice_id: str):
-#         self.target_lang = target_lang
-#         if voice_id != self.voice_id:
-#             self.voice_id = voice_id
-#             self._tts = elevenlabs.TTS(
-#                 model="eleven_multilingual_v2",
-#                 voice_id=self.voice_id,
-#                 api_key=os.environ.get("ELEVEN_API_KEY")
-#                 or os.environ.get("ELEVENLABS_API_KEY"),
-#             )
-#             self._audio_source = rtc.AudioSource(
-#                 self._tts.sample_rate, self._tts.num_channels
-#             )
-#             self._track = rtc.LocalAudioTrack.create_audio_track(
-#                 f"translation_{self.participant_identity}", self._audio_source
-#             )
-#             self._track_published = False
-
-#     async def speak(self, text: str):
-#         eleven_key = os.environ.get("ELEVEN_API_KEY") or os.environ.get(
-#             "ELEVENLABS_API_KEY"
-#         )
-#         logger.info(
-#             f"🔑 TTS KEY AT SPEAK TIME: {'SET' if eleven_key else 'NOT SET'} — first 8 chars: {eleven_key[:8] if eleven_key else 'NONE'}"
-#         )
-
-#         if not text.strip():
-#             return
-
-#         if self.target_lang == "no-translate":
-#             return
-
-#         try:
-#             translated_text = GoogleTranslator(
-#                 source="auto", target=self.target_lang
-#             ).translate(text)
-#         except Exception as e:
-#             logger.error(f"Translation error for {self.participant_identity}: {e}")
-#             return
-
-#         logger.info(
-#             f"[for {self.participant_identity}] "
-#             f"(auto->{self.target_lang}) "
-#             f"{text!r} -> {translated_text!r}"
-#         )
-
-#         async with self._lock:
-#             try:
-#                 if not self._track_published:
-#                     await self.room.local_participant.publish_track(self._track)
-#                     self._track_published = True
-
-#                 async for synthesized in self._tts.synthesize(translated_text):
-#                     await self._audio_source.capture_frame(synthesized.frame)
-
-#             except Exception as e:
-#                 logger.error(f"TTS/publish error for {self.participant_identity}: {e}")
-
-
 class ListenerAudioPublisher:
     def __init__(self, participant_identity: str, room: rtc.Room, voice_id: str):
         self.participant_identity = participant_identity
@@ -167,6 +85,7 @@ class ListenerAudioPublisher:
         self.target_lang = target_lang
         self.voice_id = voice_id
 
+    
     async def speak(self, text: str):
         if not text.strip():
             return
@@ -189,6 +108,18 @@ class ListenerAudioPublisher:
 
         async with self._lock:
             try:
+                if not self._track_published:
+                    await self.room.local_participant.set_metadata(
+                        json.dumps(
+                            {
+                                "is_agent": True,
+                                "translated_user": self.participant_identity,
+                            }
+                        )
+                    )
+                    await self.room.local_participant.publish_track(self._track)
+                    self._track_published = True
+
                 tts = gTTS(text=translated_text, lang=self.target_lang[:2], slow=False)
                 mp3_buffer = io.BytesIO()
                 tts.write_to_fp(mp3_buffer)
@@ -196,10 +127,6 @@ class ListenerAudioPublisher:
 
                 container = pyav.open(mp3_buffer, format="mp3")
                 resampler = pyav.AudioResampler(format="s16", layout="mono", rate=24000)
-
-                if not self._track_published:
-                    await self.room.local_participant.publish_track(self._track)
-                    self._track_published = True
 
                 for frame in container.decode(audio=0):
                     for resampled in resampler.resample(frame):
@@ -214,7 +141,6 @@ class ListenerAudioPublisher:
 
             except Exception as e:
                 logger.error(f"TTS/publish error for {self.participant_identity}: {e}")
-
 
 # ================================================================
 #  SPEAKER TRANSCRIBER
