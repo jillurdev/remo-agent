@@ -8,6 +8,7 @@ import json
 import time
 import re
 import os
+import base64
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
@@ -65,6 +66,7 @@ def run_health_server():
 
 # ================================================================
 #  LISTENER AUDIO PUBLISHER
+#  Audio Track এর বদলে Data Channel দিয়ে শুধু target participant কে পাঠাবে
 # ================================================================
 
 
@@ -74,12 +76,6 @@ class ListenerAudioPublisher:
         self.room = room
         self.target_lang = "no-translate"
         self.voice_id = voice_id
-
-        self._audio_source = rtc.AudioSource(24000, 1)
-        self._track = rtc.LocalAudioTrack.create_audio_track(
-            f"translation_{participant_identity}", self._audio_source
-        )
-        self._track_published = False
         self._lock = asyncio.Lock()
 
     def update_settings(self, target_lang: str, voice_id: str):
@@ -89,7 +85,7 @@ class ListenerAudioPublisher:
     def _get_edge_voice(self, lang: str) -> str:
         voice_map = {
             "hi": "hi-IN-SwaraNeural",
-            "bn": "bn-IN-TanishaaNeural",
+            "bn": "bn-BD-NabanitaNeural",
             "en": "en-US-JennyNeural",
             "ar": "ar-SA-ZariyahNeural",
             "fr": "fr-FR-DeniseNeural",
@@ -107,6 +103,48 @@ class ListenerAudioPublisher:
         }
         code = lang[:2].lower()
         return voice_map.get(code, "en-US-JennyNeural")
+
+    def _split_sentences(self, text: str) -> list[str]:
+        parts = re.split(r"(?<=[.!?।])\s+", text.strip())
+        return [p for p in parts if p.strip()]
+
+    async def _speak_sentence(self, translated_text: str):
+        try:
+            voice = self._get_edge_voice(self.target_lang)
+            communicate = edge_tts.Communicate(translated_text, voice)
+
+            mp3_buffer = io.BytesIO()
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    mp3_buffer.write(chunk["data"])
+
+            mp3_data = mp3_buffer.getvalue()
+            if not mp3_data:
+                return
+
+            audio_b64 = base64.b64encode(mp3_data).decode("utf-8")
+
+            payload = json.dumps(
+                {
+                    "type": "translation_audio",
+                    "audio_b64": audio_b64,
+                    "lang": self.target_lang,
+                }
+            ).encode("utf-8")
+
+            await self.room.local_participant.publish_data(
+                payload=payload,
+                reliable=True,
+                topic="translation_audio",
+                destination_identities=[self.participant_identity],
+            )
+
+            logger.info(
+                f"[audio→{self.participant_identity}] sent {len(mp3_data)} bytes"
+            )
+
+        except Exception as e:
+            logger.error(f"TTS/send error for {self.participant_identity}: {e}")
 
     async def speak(self, text: str):
         if not text.strip():
@@ -128,46 +166,11 @@ class ListenerAudioPublisher:
             f"{text!r} -> {translated_text!r}"
         )
 
+        sentences = self._split_sentences(translated_text)
+
         async with self._lock:
-            try:
-                if not self._track_published:
-                    await self.room.local_participant.set_metadata(
-                        json.dumps(
-                            {
-                                "is_agent": True,
-                                "translated_user": self.participant_identity,
-                            }
-                        )
-                    )
-                    await self.room.local_participant.publish_track(self._track)
-                    self._track_published = True
-
-                # edge-tts দিয়ে audio generate করো
-                voice = self._get_edge_voice(self.target_lang)
-                communicate = edge_tts.Communicate(translated_text, voice)
-
-                mp3_buffer = io.BytesIO()
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        mp3_buffer.write(chunk["data"])
-                mp3_buffer.seek(0)
-
-                container = pyav.open(mp3_buffer, format="mp3")
-                resampler = pyav.AudioResampler(format="s16", layout="mono", rate=24000)
-
-                for frame in container.decode(audio=0):
-                    for resampled in resampler.resample(frame):
-                        pcm = resampled.to_ndarray().flatten()
-                        audio_frame = rtc.AudioFrame(
-                            data=pcm.astype(np.int16).tobytes(),
-                            sample_rate=24000,
-                            num_channels=1,
-                            samples_per_channel=len(pcm),
-                        )
-                        await self._audio_source.capture_frame(audio_frame)
-
-            except Exception as e:
-                logger.error(f"TTS/publish error for {self.participant_identity}: {e}")
+            for sentence in sentences:
+                await self._speak_sentence(sentence)
 
 
 # ================================================================
@@ -230,7 +233,7 @@ class SpeakerTranscriber(Agent):
         super().__init__(
             instructions="not-needed",
             stt=self.stt_plugin,
-            tts=None,  # gTTS/ElevenLabs লাগবে না, edge-tts use করছি
+            tts=None,  
         )
 
     async def on_user_turn_completed(self, _, new_message: llm.ChatMessage):
@@ -397,10 +400,9 @@ class MultiUserTranslationManager:
         if not listeners_to_speak:
             return
 
-        await asyncio.gather(
-            *[listener.speak(transcript) for listener in listeners_to_speak],
-            return_exceptions=True,
-        )
+        # সব listener কে parallel এ পাঠাও — একজনের জন্য অপেক্ষা করবে না
+        for listener in listeners_to_speak:
+            asyncio.create_task(listener.speak(transcript))
 
     async def _start_speaker_session(self, participant: rtc.RemoteParticipant):
         logger.info(f"⚙️ STARTING SESSION: {participant.identity}")
