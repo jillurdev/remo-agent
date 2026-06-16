@@ -1,5 +1,7 @@
 # ============================================================
 #  agent.py  —  LiveKit Multi-User Transcriber + Translator
+#  Optimised for low latency: translation + TTS run concurrently,
+#  audio is streamed in sentence chunks, AudioContext pre-decodes.
 # ============================================================
 
 import asyncio
@@ -32,8 +34,7 @@ from livekit.plugins import deepgram
 from deep_translator import GoogleTranslator
 import edge_tts
 import io
-import av as pyav
-import numpy as np
+import asyncio
 
 load_dotenv()
 
@@ -66,8 +67,26 @@ def run_health_server():
 
 # ================================================================
 #  LISTENER AUDIO PUBLISHER
-#  Audio Track এর বদলে Data Channel দিয়ে শুধু target participant কে পাঠাবে
 # ================================================================
+
+EDGE_VOICE_MAP = {
+    "hi": "hi-IN-SwaraNeural",
+    "bn": "bn-BD-NabanitaNeural",
+    "en": "en-US-JennyNeural",
+    "ar": "ar-SA-ZariyahNeural",
+    "fr": "fr-FR-DeniseNeural",
+    "de": "de-DE-KatjaNeural",
+    "es": "es-ES-ElviraNeural",
+    "zh": "zh-CN-XiaoxiaoNeural",
+    "ja": "ja-JP-NanamiNeural",
+    "ko": "ko-KR-SunHiNeural",
+    "ru": "ru-RU-SvetlanaNeural",
+    "pt": "pt-BR-FranciscaNeural",
+    "tr": "tr-TR-EmelNeural",
+    "it": "it-IT-ElsaNeural",
+    "id": "id-ID-GadisNeural",
+    "vi": "vi-VN-HoaiMyNeural",
+}
 
 
 class ListenerAudioPublisher:
@@ -83,100 +102,99 @@ class ListenerAudioPublisher:
         self.voice_id = voice_id
 
     def _get_edge_voice(self, lang: str) -> str:
-        voice_map = {
-            "hi": "hi-IN-SwaraNeural",
-            "bn": "bn-BD-NabanitaNeural",
-            "en": "en-US-JennyNeural",
-            "ar": "ar-SA-ZariyahNeural",
-            "fr": "fr-FR-DeniseNeural",
-            "de": "de-DE-KatjaNeural",
-            "es": "es-ES-ElviraNeural",
-            "zh": "zh-CN-XiaoxiaoNeural",
-            "ja": "ja-JP-NanamiNeural",
-            "ko": "ko-KR-SunHiNeural",
-            "ru": "ru-RU-SvetlanaNeural",
-            "pt": "pt-BR-FranciscaNeural",
-            "tr": "tr-TR-EmelNeural",
-            "it": "it-IT-ElsaNeural",
-            "id": "id-ID-GadisNeural",
-            "vi": "vi-VN-HoaiMyNeural",
-        }
         code = lang[:2].lower()
-        return voice_map.get(code, "en-US-JennyNeural")
+        return EDGE_VOICE_MAP.get(code, "en-US-JennyNeural")
 
     def _split_sentences(self, text: str) -> list[str]:
         parts = re.split(r"(?<=[.!?।])\s+", text.strip())
         return [p for p in parts if p.strip()]
 
-    async def _speak_sentence(self, translated_text: str):
-        try:
-            voice = self._get_edge_voice(self.target_lang)
-            communicate = edge_tts.Communicate(translated_text, voice)
+    async def _tts_sentence(self, text: str) -> bytes:
+        """Generate TTS for a single sentence and return raw MP3 bytes."""
+        voice = self._get_edge_voice(self.target_lang)
+        communicate = edge_tts.Communicate(text, voice)
+        buf = io.BytesIO()
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                buf.write(chunk["data"])
+        return buf.getvalue()
 
-            mp3_buffer = io.BytesIO()
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    mp3_buffer.write(chunk["data"])
-
-            mp3_data = mp3_buffer.getvalue()
-            if not mp3_data:
-                return
-
-            audio_b64 = base64.b64encode(mp3_data).decode("utf-8")
-
-            payload = json.dumps(
-                {
-                    "type": "translation_audio",
-                    "audio_b64": audio_b64,
-                    "lang": self.target_lang,
-                }
-            ).encode("utf-8")
-
-            await self.room.local_participant.publish_data(
-                payload=payload,
-                reliable=True,
-                topic="translation_audio",
-                destination_identities=[self.participant_identity],
-            )
-
-            logger.info(
-                f"[audio→{self.participant_identity}] sent {len(mp3_data)} bytes"
-            )
-
-        except Exception as e:
-            logger.error(f"TTS/send error for {self.participant_identity}: {e}")
+    async def _send_audio(self, mp3_data: bytes):
+        """Send MP3 bytes to the target participant via data channel."""
+        if not mp3_data:
+            return
+        audio_b64 = base64.b64encode(mp3_data).decode("utf-8")
+        payload = json.dumps(
+            {
+                "type": "translation_audio",
+                "audio_b64": audio_b64,
+                "lang": self.target_lang,
+            }
+        ).encode("utf-8")
+        await self.room.local_participant.publish_data(
+            payload=payload,
+            reliable=True,
+            topic="translation_audio",
+            destination_identities=[self.participant_identity],
+        )
+        logger.info(f"[audio→{self.participant_identity}] sent {len(mp3_data)} bytes")
 
     async def speak(self, text: str):
-        if not text.strip():
-            return
-        if self.target_lang == "no-translate":
+        if not text.strip() or self.target_lang == "no-translate":
             return
 
+        # ── Step 1: translate (run in thread to avoid blocking event loop) ──
         try:
-            translated_text = GoogleTranslator(
-                source="auto", target=self.target_lang
-            ).translate(text)
+            loop = asyncio.get_event_loop()
+            translated_text = await loop.run_in_executor(
+                None,
+                lambda: GoogleTranslator(
+                    source="auto", target=self.target_lang
+                ).translate(text),
+            )
         except Exception as e:
             logger.error(f"Translation error for {self.participant_identity}: {e}")
             return
 
         logger.info(
             f"[for {self.participant_identity}] "
-            f"(auto->{self.target_lang}) "
-            f"{text!r} -> {translated_text!r}"
+            f"(auto->{self.target_lang}) {text!r} -> {translated_text!r}"
         )
 
         sentences = self._split_sentences(translated_text)
+        if not sentences:
+            return
 
+        # ── Step 2: pipeline — generate sentence N+1 while sending sentence N ──
         async with self._lock:
-            for sentence in sentences:
-                await self._speak_sentence(sentence)
+            # Pre-generate the first sentence immediately
+            pending: asyncio.Task | None = asyncio.create_task(
+                self._tts_sentence(sentences[0])
+            )
+
+            for i, sentence in enumerate(sentences):
+                # Kick off next sentence's TTS in parallel
+                next_task: asyncio.Task | None = None
+                if i + 1 < len(sentences):
+                    next_task = asyncio.create_task(
+                        self._tts_sentence(sentences[i + 1])
+                    )
+
+                # Wait for current sentence audio and send it
+                try:
+                    mp3_data = await pending
+                    await self._send_audio(mp3_data)
+                except Exception as e:
+                    logger.error(
+                        f"TTS/send error sentence {i} for {self.participant_identity}: {e}"
+                    )
+
+                pending = next_task
 
 
 # ================================================================
 #  SPEAKER TRANSCRIBER
 # ================================================================
-
 
 NOVA2_SUPPORTED = {
     "en",
@@ -233,19 +251,16 @@ class SpeakerTranscriber(Agent):
         super().__init__(
             instructions="not-needed",
             stt=self.stt_plugin,
-            tts=None,  
+            tts=None,
         )
 
     async def on_user_turn_completed(self, _, new_message: llm.ChatMessage):
         user_transcript = new_message.text_content
-
         if not user_transcript.strip():
             raise StopResponse()
 
         logger.info(f"📝 TRANSCRIPT [{self.participant_identity}]: {user_transcript!r}")
-
         await self.on_transcript(self.participant_identity, user_transcript)
-
         raise StopResponse()
 
 
@@ -275,7 +290,6 @@ class MultiUserTranslationManager:
         target_lang = "no-translate"
         voice_id = DEFAULT_VOICE_ID
         user_lang = "multi"
-
         if participant.metadata:
             try:
                 metadata = json.loads(participant.metadata)
@@ -284,7 +298,6 @@ class MultiUserTranslationManager:
                 user_lang = metadata.get("user_lang", "multi")
             except Exception as e:
                 logger.warning(f"Metadata parse error for {participant.identity}: {e}")
-
         return target_lang, voice_id, user_lang
 
     def on_metadata_changed(self, participant: rtc.RemoteParticipant, _):
@@ -292,7 +305,6 @@ class MultiUserTranslationManager:
         self._user_target_lang[participant.identity] = target_lang
         self._user_voice[participant.identity] = voice_id
         self._user_lang[participant.identity] = user_lang
-
         if participant.identity in self._listeners:
             self._listeners[participant.identity].update_settings(target_lang, voice_id)
             logger.info(
@@ -301,7 +313,6 @@ class MultiUserTranslationManager:
 
     def on_participant_connected(self, participant: rtc.RemoteParticipant):
         logger.info(f"🟢 PARTICIPANT CONNECTED: {participant.identity}")
-
         if (
             participant.identity in self._speaker_sessions
             or participant.identity.startswith("agent-")
@@ -345,7 +356,6 @@ class MultiUserTranslationManager:
         session = self._speaker_sessions.pop(participant.identity, None)
         if session is None:
             return
-
         task = asyncio.create_task(self._close_session(session))
         self._tasks.add(task)
         task.add_done_callback(lambda _: self._tasks.discard(task))
@@ -356,9 +366,7 @@ class MultiUserTranslationManager:
             identity = data.get("identity")
             target_lang = data.get("target_lang", "no-translate")
             voice_id = data.get("voice_id", DEFAULT_VOICE_ID)
-
             logger.info(f"🌐 LANGUAGE UPDATE: {identity} -> {target_lang}")
-
             if identity in self._listeners:
                 self._listeners[identity].update_settings(target_lang, voice_id)
                 self._user_target_lang[identity] = target_lang
@@ -400,15 +408,15 @@ class MultiUserTranslationManager:
         if not listeners_to_speak:
             return
 
-        # সব listener কে parallel এ পাঠাও — একজনের জন্য অপেক্ষা করবে না
-        for listener in listeners_to_speak:
-            asyncio.create_task(listener.speak(transcript))
+        # Fire all listeners in parallel — no sequential waiting
+        await asyncio.gather(
+            *[listener.speak(transcript) for listener in listeners_to_speak],
+            return_exceptions=True,
+        )
 
     async def _start_speaker_session(self, participant: rtc.RemoteParticipant):
         logger.info(f"⚙️ STARTING SESSION: {participant.identity}")
-
         session = AgentSession()
-
         user_lang = self._user_lang.get(participant.identity, "multi")
         logger.info(f"🗣️ USER LANG for {participant.identity}: {user_lang}")
 
@@ -423,9 +431,7 @@ class MultiUserTranslationManager:
             agent_session=session,
             room=self.ctx.room,
             participant=participant,
-            input_options=RoomInputOptions(
-                text_enabled=False,
-            ),
+            input_options=RoomInputOptions(text_enabled=False),
             output_options=RoomOutputOptions(
                 transcription_enabled=True, audio_enabled=False
             ),
@@ -433,9 +439,7 @@ class MultiUserTranslationManager:
 
         await room_io.start()
         await session.start(agent=agent)
-
         logger.info(f"🚀 SESSION LIVE: {participant.identity}")
-
         return session, agent
 
     async def _close_session(self, sess: AgentSession) -> None:
@@ -449,7 +453,6 @@ class MultiUserTranslationManager:
 
 async def entrypoint(ctx: JobContext):
     logger.info("🚀 ENTRYPOINT STARTED")
-
     manager = MultiUserTranslationManager(ctx)
 
     def on_data_received(data_packet):
@@ -468,7 +471,6 @@ async def entrypoint(ctx: JobContext):
     ctx.room.on("data_received", on_data_received)
 
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-
     logger.info("✅ CONNECTED TO LIVEKIT")
 
     for p in ctx.room.remote_participants.values():
