@@ -16,7 +16,7 @@ from livekit.agents import (
     utils,
 )
 from livekit.plugins import noise_cancellation
-import pydub
+import av
 import io
 
 load_dotenv()
@@ -77,10 +77,20 @@ CHUNK_SIZE = int(API_SAMPLE_RATE * (CHUNK_DURATION_MS / 1000) * 2)  # 16-bit = 2
 def mp3_bytes_to_pcm(
     mp3_bytes: bytes, target_sample_rate: int = LIVEKIT_SAMPLE_RATE
 ) -> bytes:
-    """Convert MP3 bytes to raw PCM bytes at target sample rate."""
-    audio = pydub.AudioSegment.from_file(io.BytesIO(mp3_bytes), format="mp3")
-    audio = audio.set_frame_rate(target_sample_rate).set_channels(1).set_sample_width(2)
-    return audio.raw_data
+    """Convert MP3 bytes to raw 16-bit PCM bytes at target sample rate using av."""
+    container = av.open(io.BytesIO(mp3_bytes), format="mp3")
+    resampler = av.AudioResampler(
+        format="s16",
+        layout="mono",
+        rate=target_sample_rate,
+    )
+    pcm_chunks = []
+    for frame in container.decode(audio=0):
+        for resampled in resampler.resample(frame):
+            pcm_chunks.append(bytes(resampled.planes[0]))
+    for resampled in resampler.resample(None):
+        pcm_chunks.append(bytes(resampled.planes[0]))
+    return b"".join(pcm_chunks)
 
 
 class VoiceAPIClient:
