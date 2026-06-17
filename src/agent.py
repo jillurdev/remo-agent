@@ -304,6 +304,7 @@ class ParticipantTranscriber:
         self._pcm_buffer = bytearray()
         self._voice_client: VoiceAPIClient | None = None
         self._audio_tasks: set[asyncio.Task] = set()
+        self._subscribed_track_sids: set[str] = set()
 
         self._audio_source = rtc.AudioSource(LIVEKIT_SAMPLE_RATE, LIVEKIT_CHANNELS)
         self._track = rtc.LocalAudioTrack.create_audio_track(
@@ -466,27 +467,33 @@ class ParticipantTranscriber:
             f"(input_lang={self.from_lang}, output_lang={self.target_lang})"
         )
 
+    def handle_track_subscribed(self, track: rtc.Track):
+        """Called for any audio track that gets subscribed for this participant.
+
+        NOTE: `track_subscribed` is a Room-level event in the LiveKit Python SDK
+        (RemoteParticipant has no `.on()` method), so MultiUserTranscriber listens
+        on the room and routes the event here. This also handles tracks that were
+        already subscribed before `start()` ran.
+        """
+        if track.kind != rtc.TrackKind.KIND_AUDIO:
+            return
+        if track.sid in self._subscribed_track_sids:
+            return  # avoid double-forwarding the same track
+        self._subscribed_track_sids.add(track.sid)
+
+        logger.info(f"[{self.participant.identity}] Audio track subscribed")
+        task = asyncio.create_task(self._forward_audio(track))
+        self._audio_tasks.add(task)
+        task.add_done_callback(self._audio_tasks.discard)
+
     async def start(self):
-        """Subscribe to participant's audio tracks."""
-
-        async def on_track_subscribed(track: rtc.Track, *_):
-            if track.kind == rtc.TrackKind.KIND_AUDIO:
-                logger.info(f"[{self.participant.identity}] Audio track subscribed")
-                task = asyncio.create_task(self._forward_audio(track))
-                self._audio_tasks.add(task)
-                task.add_done_callback(self._audio_tasks.discard)
-
-        self.participant.on("track_subscribed", on_track_subscribed)
-
-        # Handle already-subscribed tracks
+        """Handle any audio tracks already subscribed at setup time."""
         for pub in self.participant.track_publications.values():
             if pub.track and pub.track.kind == rtc.TrackKind.KIND_AUDIO:
                 logger.info(
                     f"[{self.participant.identity}] Existing audio track found, subscribing"
                 )
-                task = asyncio.create_task(self._forward_audio(pub.track))
-                self._audio_tasks.add(task)
-                task.add_done_callback(self._audio_tasks.discard)
+                self.handle_track_subscribed(pub.track)
 
         await self._update_agent_metadata()
 
@@ -521,12 +528,14 @@ class MultiUserTranscriber:
         self.ctx.room.on("participant_connected", self.on_participant_connected)
         self.ctx.room.on("participant_disconnected", self.on_participant_disconnected)
         self.ctx.room.on("participant_metadata_changed", self.on_metadata_changed)
+        self.ctx.room.on("track_subscribed", self.on_track_subscribed)
         logger.info("MultiUserTranscriber started, listening for room events")
 
     async def aclose(self):
         self.ctx.room.off("participant_connected", self.on_participant_connected)
         self.ctx.room.off("participant_disconnected", self.on_participant_disconnected)
         self.ctx.room.off("participant_metadata_changed", self.on_metadata_changed)
+        self.ctx.room.off("track_subscribed", self.on_track_subscribed)
         await utils.aio.cancel_and_wait(*self._tasks)
         for t in self._transcribers.values():
             t.close()
@@ -545,6 +554,26 @@ class MultiUserTranscriber:
                 logger.warning(f"[{participant.identity}] Metadata parse error: {e}")
 
         return from_lang, target_lang
+
+    def on_track_subscribed(
+        self,
+        track: rtc.Track,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
+    ):
+        """Room-level event: routes to the right participant's transcriber.
+
+        (RemoteParticipant itself has no `.on()` method, so this must be
+        registered on the Room, not on individual participants.)
+        """
+        t = self._transcribers.get(participant.identity)
+        if not t:
+            logger.warning(
+                f"[{participant.identity}] track_subscribed fired but no "
+                f"transcriber is registered for them yet"
+            )
+            return
+        t.handle_track_subscribed(track)
 
     def on_metadata_changed(self, participant: rtc.RemoteParticipant, _):
         from_lang, target_lang = self._parse_settings(participant)
