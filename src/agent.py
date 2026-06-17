@@ -319,7 +319,11 @@ class ParticipantTranscriber:
 
         if target_lang and target_lang != "no-translate":
             logger.info(f"[{participant.identity}] AI translation is ON at startup")
-            self._init_voice_client()
+            # Run in executor: VoiceAPIClient.start() blocks the calling thread
+            # for up to 10s waiting for the connection to become ready. Doing
+            # this directly here would freeze the whole asyncio event loop
+            # (no audio forwarding, no room events) for everyone in the room.
+            self._loop.run_in_executor(None, self._init_voice_client)
         else:
             logger.info(f"[{participant.identity}] AI translation is OFF at startup")
 
@@ -445,7 +449,9 @@ class ParticipantTranscriber:
                     f"[{self.participant.identity}] AI translation turned ON "
                     f"(target={new_target_lang})"
                 )
-                self._init_voice_client()
+                # Same reasoning as in __init__: keep the blocking 10s wait
+                # off the event loop so other participants aren't affected.
+                self._loop.run_in_executor(None, self._init_voice_client)
         else:
             if self._voice_client:
                 logger.info(f"[{self.participant.identity}] AI translation turned OFF")
