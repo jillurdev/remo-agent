@@ -1,489 +1,470 @@
-# ============================================================
-#  agent.py  —  LiveKit Multi-User Transcriber + Translator
-#  Optimised for low latency: translation + TTS run concurrently,
-#  audio is streamed in sentence chunks, AudioContext pre-decodes.
-# ============================================================
-
 import asyncio
 import logging
 import json
 import time
 import re
-import os
-import base64
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import websocket
 from dotenv import load_dotenv
 
 from livekit import rtc
 from livekit.agents import (
-    Agent,
-    AgentSession,
     AutoSubscribe,
     JobContext,
-    RoomInputOptions,
-    RoomIO,
-    RoomOutputOptions,
-    StopResponse,
     WorkerOptions,
     cli,
-    llm,
     utils,
 )
-from livekit.plugins import deepgram
-from deep_translator import GoogleTranslator
-import edge_tts
+from livekit.plugins import noise_cancellation
+import pydub
 import io
-import asyncio
 
 load_dotenv()
-
 logger = logging.getLogger("transcriber")
 
-DEFAULT_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"
+VOICE_API_URL = "wss://voice-agent-437894783947.us-central1.run.app/ws/stream"
 
-
-# ================================================================
-#  HEALTH CHECK SERVER
-# ================================================================
-
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ok")
-
-    def log_message(self, *args):
-        pass
-
-
-def run_health_server():
-    port = int(os.environ.get("PORT", 8000))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logger.info(f"Health check server running on port {port}")
-    server.serve_forever()
-
-
-# ================================================================
-#  LISTENER AUDIO PUBLISHER
-# ================================================================
-
-EDGE_VOICE_MAP = {
-    "hi": "hi-IN-SwaraNeural",
-    "bn": "bn-BD-NabanitaNeural",
-    "en": "en-US-JennyNeural",
-    "ar": "ar-SA-ZariyahNeural",
-    "fr": "fr-FR-DeniseNeural",
-    "de": "de-DE-KatjaNeural",
-    "es": "es-ES-ElviraNeural",
-    "zh": "zh-CN-XiaoxiaoNeural",
-    "ja": "ja-JP-NanamiNeural",
-    "ko": "ko-KR-SunHiNeural",
-    "ru": "ru-RU-SvetlanaNeural",
-    "pt": "pt-BR-FranciscaNeural",
-    "tr": "tr-TR-EmelNeural",
-    "it": "it-IT-ElsaNeural",
-    "id": "id-ID-GadisNeural",
-    "vi": "vi-VN-HoaiMyNeural",
+LANG_CODE_TO_NAME = {
+    "en": "English",
+    "bn": "Bengali",
+    "fr": "French",
+    "ar": "Arabic",
+    "zh": "Chinese (Simplified)",
+    "zh-tw": "Chinese (Traditional)",
+    "de": "German",
+    "es": "Spanish",
+    "hi": "Hindi",
+    "id": "Indonesian",
+    "it": "Italian",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "ms": "Malay",
+    "nl": "Dutch",
+    "pl": "Polish",
+    "pt": "Portuguese",
+    "ru": "Russian",
+    "sv": "Swedish",
+    "th": "Thai",
+    "tr": "Turkish",
+    "uk": "Ukrainian",
+    "ur": "Urdu",
+    "vi": "Vietnamese",
+    "fa": "Persian",
+    "he": "Hebrew",
+    "cs": "Czech",
+    "da": "Danish",
+    "el": "Greek",
+    "fi": "Finnish",
+    "hu": "Hungarian",
+    "no": "Norwegian",
+    "ro": "Romanian",
+    "sw": "Swahili",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "af": "Afrikaans",
+    "ha": "Hausa",
+    "ig": "Igbo",
+    "yo": "Yoruba",
 }
 
+LIVEKIT_SAMPLE_RATE = 48000
+LIVEKIT_CHANNELS = 1
+API_SAMPLE_RATE = 16000
+CHUNK_DURATION_MS = 200
+CHUNK_SIZE = int(API_SAMPLE_RATE * (CHUNK_DURATION_MS / 1000) * 2)  # 16-bit = 2 bytes
 
-class ListenerAudioPublisher:
-    def __init__(self, participant_identity: str, room: rtc.Room, voice_id: str):
-        self.participant_identity = participant_identity
-        self.room = room
-        self.target_lang = "no-translate"
-        self.voice_id = voice_id
-        self._lock = asyncio.Lock()
 
-    def update_settings(self, target_lang: str, voice_id: str):
-        self.target_lang = target_lang
-        self.voice_id = voice_id
+def mp3_bytes_to_pcm(
+    mp3_bytes: bytes, target_sample_rate: int = LIVEKIT_SAMPLE_RATE
+) -> bytes:
+    """Convert MP3 bytes to raw PCM bytes at target sample rate."""
+    audio = pydub.AudioSegment.from_file(io.BytesIO(mp3_bytes), format="mp3")
+    audio = audio.set_frame_rate(target_sample_rate).set_channels(1).set_sample_width(2)
+    return audio.raw_data
 
-    def _get_edge_voice(self, lang: str) -> str:
-        code = lang[:2].lower()
-        return EDGE_VOICE_MAP.get(code, "en-US-JennyNeural")
 
-    def _split_sentences(self, text: str) -> list[str]:
-        parts = re.split(r"(?<=[.!?।])\s+", text.strip())
-        return [p for p in parts if p.strip()]
+class VoiceAPIClient:
+    """Persistent WebSocket connection to the Voice Translator API for one participant."""
 
-    async def _tts_sentence(self, text: str) -> bytes:
-        """Generate TTS for a single sentence and return raw MP3 bytes."""
-        voice = self._get_edge_voice(self.target_lang)
-        communicate = edge_tts.Communicate(text, voice)
-        buf = io.BytesIO()
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                buf.write(chunk["data"])
-        return buf.getvalue()
+    def __init__(self, target_lang: str, on_mp3: callable, on_transcript: callable):
+        self._target_lang = target_lang
+        self._on_mp3 = on_mp3
+        self._on_transcript = on_transcript
+        self._ws: websocket.WebSocket | None = None
+        self._ready = threading.Event()
+        self._closed = False
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
 
-    async def _send_audio(self, mp3_data: bytes):
-        """Send MP3 bytes to the target participant via data channel."""
-        if not mp3_data:
-            return
-        audio_b64 = base64.b64encode(mp3_data).decode("utf-8")
-        payload = json.dumps(
-            {
-                "type": "translation_audio",
-                "audio_b64": audio_b64,
-                "lang": self.target_lang,
-            }
-        ).encode("utf-8")
-        await self.room.local_participant.publish_data(
-            payload=payload,
-            reliable=True,
-            topic="translation_audio",
-            destination_identities=[self.participant_identity],
-        )
-        logger.info(f"[audio→{self.participant_identity}] sent {len(mp3_data)} bytes")
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=10)
 
-    async def speak(self, text: str):
-        if not text.strip() or self.target_lang == "no-translate":
-            return
-
-        # ── Step 1: translate (run in thread to avoid blocking event loop) ──
+    def _run(self):
         try:
-            loop = asyncio.get_event_loop()
-            translated_text = await loop.run_in_executor(
-                None,
-                lambda: GoogleTranslator(
-                    source="auto", target=self.target_lang
-                ).translate(text),
-            )
-        except Exception as e:
-            logger.error(f"Translation error for {self.participant_identity}: {e}")
-            return
+            self._ws = websocket.create_connection(VOICE_API_URL)
+            logger.info("VoiceAPI WS connected")
 
-        logger.info(
-            f"[for {self.participant_identity}] "
-            f"(auto->{self.target_lang}) {text!r} -> {translated_text!r}"
-        )
+            # Wait for ready signal
+            raw = self._ws.recv()
+            msg = json.loads(raw)
+            if msg.get("type") == "ready":
+                logger.info(f"VoiceAPI ready, client_id={msg.get('client_id')}")
 
-        sentences = self._split_sentences(translated_text)
-        if not sentences:
-            return
+            # Set output language
+            lang_name = LANG_CODE_TO_NAME.get(self._target_lang, self._target_lang)
+            self._ws.send(json.dumps({"type": "set_language", "language": lang_name}))
 
-        # ── Step 2: pipeline — generate sentence N+1 while sending sentence N ──
-        async with self._lock:
-            # Pre-generate the first sentence immediately
-            pending: asyncio.Task | None = asyncio.create_task(
-                self._tts_sentence(sentences[0])
-            )
+            # Wait for language_set confirmation
+            raw = self._ws.recv()
+            msg = json.loads(raw)
+            if msg.get("type") == "language_set":
+                logger.info(f"VoiceAPI language set to: {msg.get('language')}")
 
-            for i, sentence in enumerate(sentences):
-                # Kick off next sentence's TTS in parallel
-                next_task: asyncio.Task | None = None
-                if i + 1 < len(sentences):
-                    next_task = asyncio.create_task(
-                        self._tts_sentence(sentences[i + 1])
-                    )
+            self._ready.set()
 
-                # Wait for current sentence audio and send it
+            # Start keepalive
+            threading.Thread(target=self._keepalive, daemon=True).start()
+
+            # Receive loop
+            while not self._closed:
                 try:
-                    mp3_data = await pending
-                    await self._send_audio(mp3_data)
+                    data = self._ws.recv()
+                    if isinstance(data, bytes):
+                        self._on_mp3(data)
+                    else:
+                        msg = json.loads(data)
+                        msg_type = msg.get("type")
+                        if msg_type == "transcript":
+                            self._on_transcript(msg)
+                        elif msg_type == "pong":
+                            pass
+                        elif msg_type == "processing":
+                            logger.debug("VoiceAPI processing...")
+                        elif msg_type == "error":
+                            logger.error(f"VoiceAPI error: {msg.get('message')}")
+                        else:
+                            logger.debug(f"VoiceAPI msg: {msg}")
                 except Exception as e:
-                    logger.error(
-                        f"TTS/send error sentence {i} for {self.participant_identity}: {e}"
+                    if not self._closed:
+                        logger.error(f"VoiceAPI recv error: {e}")
+                    break
+
+        except Exception as e:
+            logger.error(f"VoiceAPI connection failed: {e}")
+            self._ready.set()  # unblock even on failure
+
+    def _keepalive(self):
+        while not self._closed:
+            time.sleep(15)
+            try:
+                with self._lock:
+                    if self._ws and not self._closed:
+                        self._ws.send(json.dumps({"type": "ping"}))
+            except Exception as e:
+                logger.warning(f"Keepalive ping failed: {e}")
+                break
+
+    def send_pcm(self, pcm_bytes: bytes):
+        try:
+            with self._lock:
+                if self._ws and not self._closed:
+                    self._ws.send_binary(pcm_bytes)
+        except Exception as e:
+            logger.error(f"VoiceAPI send_pcm error: {e}")
+
+    def flush(self):
+        try:
+            with self._lock:
+                if self._ws and not self._closed:
+                    self._ws.send(json.dumps({"type": "flush"}))
+        except Exception as e:
+            logger.error(f"VoiceAPI flush error: {e}")
+
+    def update_language(self, new_target_lang: str):
+        self._target_lang = new_target_lang
+        lang_name = LANG_CODE_TO_NAME.get(new_target_lang, new_target_lang)
+        try:
+            with self._lock:
+                if self._ws and not self._closed:
+                    self._ws.send(
+                        json.dumps({"type": "set_language", "language": lang_name})
                     )
+                    logger.info(f"VoiceAPI language updated to: {lang_name}")
+        except Exception as e:
+            logger.error(f"VoiceAPI update_language error: {e}")
 
-                pending = next_task
-
-
-# ================================================================
-#  SPEAKER TRANSCRIBER
-# ================================================================
-
-NOVA2_SUPPORTED = {
-    "en",
-    "es",
-    "fr",
-    "de",
-    "hi",
-    "pt",
-    "zh",
-    "ja",
-    "ko",
-    "it",
-    "nl",
-    "pl",
-    "ru",
-    "tr",
-    "id",
-    "vi",
-    "uk",
-    "sv",
-    "no",
-    "da",
-    "fi",
-    "cs",
-    "ro",
-    "bg",
-    "sk",
-    "hu",
-    "el",
-    "ms",
-}
+    def close(self):
+        self._closed = True
+        try:
+            if self._ws:
+                self._ws.close()
+        except Exception:
+            pass
 
 
-class SpeakerTranscriber(Agent):
+class ParticipantTranscriber:
+    """Handles audio forwarding and translation for a single participant."""
+
     def __init__(
         self,
         *,
-        participant_identity: str,
+        participant: rtc.RemoteParticipant,
         room: rtc.Room,
-        on_transcript,
-        user_lang: str = "multi",
+        from_lang: str,
+        target_lang: str,
+        loop: asyncio.AbstractEventLoop,
     ):
-        self.participant_identity = participant_identity
+        self.participant = participant
         self.room = room
-        self.on_transcript = on_transcript
+        self.from_lang = from_lang
+        self.target_lang = target_lang
+        self._loop = loop
 
-        stt_lang = user_lang if user_lang in NOVA2_SUPPORTED else "multi"
-        logger.info(f"🎤 STT LANG: {user_lang} -> {stt_lang}")
+        self._pcm_buffer = bytearray()
+        self._voice_client: VoiceAPIClient | None = None
+        self._audio_tasks: set[asyncio.Task] = set()
 
-        self.stt_plugin = deepgram.STT(
-            model="nova-2", language=stt_lang, smart_format=True
+        self._audio_source = rtc.AudioSource(LIVEKIT_SAMPLE_RATE, LIVEKIT_CHANNELS)
+        self._track = rtc.LocalAudioTrack.create_audio_track(
+            f"translation_{participant.identity}", self._audio_source
         )
+        self._track_published = False
 
-        super().__init__(
-            instructions="not-needed",
-            stt=self.stt_plugin,
-            tts=None,
+        if target_lang and target_lang != "no-translate":
+            self._init_voice_client()
+
+    def _init_voice_client(self):
+        self._voice_client = VoiceAPIClient(
+            target_lang=self.target_lang,
+            on_mp3=self._on_mp3_received,
+            on_transcript=self._on_transcript_received,
         )
+        self._voice_client.start()
 
-    async def on_user_turn_completed(self, _, new_message: llm.ChatMessage):
-        user_transcript = new_message.text_content
-        if not user_transcript.strip():
-            raise StopResponse()
+    def _on_mp3_received(self, mp3_bytes: bytes):
+        asyncio.run_coroutine_threadsafe(self._play_mp3(mp3_bytes), self._loop)
 
-        logger.info(f"📝 TRANSCRIPT [{self.participant_identity}]: {user_transcript!r}")
-        await self.on_transcript(self.participant_identity, user_transcript)
-        raise StopResponse()
+    def _on_transcript_received(self, msg: dict):
+        asyncio.run_coroutine_threadsafe(self._publish_transcript(msg), self._loop)
 
+    async def _play_mp3(self, mp3_bytes: bytes):
+        try:
+            if not self._track_published:
+                await self.room.local_participant.publish_track(self._track)
+                self._track_published = True
 
-# ================================================================
-#  MULTI-USER TRANSLATION MANAGER
-# ================================================================
-
-
-class MultiUserTranslationManager:
-    def __init__(self, ctx: JobContext):
-        self.ctx = ctx
-        self._speaker_sessions: dict[str, AgentSession] = {}
-        self._speaker_agents: dict[str, SpeakerTranscriber] = {}
-        self._listeners: dict[str, ListenerAudioPublisher] = {}
-        self._tasks: set[asyncio.Task] = set()
-        self._user_target_lang: dict[str, str] = {}
-        self._user_voice: dict[str, str] = {}
-        self._user_lang: dict[str, str] = {}
-
-    async def aclose(self):
-        await utils.aio.cancel_and_wait(*self._tasks)
-        await asyncio.gather(
-            *[self._close_session(s) for s in self._speaker_sessions.values()]
-        )
-
-    def _parse_metadata(self, participant: rtc.RemoteParticipant):
-        target_lang = "no-translate"
-        voice_id = DEFAULT_VOICE_ID
-        user_lang = "multi"
-        if participant.metadata:
-            try:
-                metadata = json.loads(participant.metadata)
-                target_lang = metadata.get("target_lang", "no-translate")
-                voice_id = metadata.get("voice_id", DEFAULT_VOICE_ID)
-                user_lang = metadata.get("user_lang", "multi")
-            except Exception as e:
-                logger.warning(f"Metadata parse error for {participant.identity}: {e}")
-        return target_lang, voice_id, user_lang
-
-    def on_metadata_changed(self, participant: rtc.RemoteParticipant, _):
-        target_lang, voice_id, user_lang = self._parse_metadata(participant)
-        self._user_target_lang[participant.identity] = target_lang
-        self._user_voice[participant.identity] = voice_id
-        self._user_lang[participant.identity] = user_lang
-        if participant.identity in self._listeners:
-            self._listeners[participant.identity].update_settings(target_lang, voice_id)
-            logger.info(
-                f"🔄 UPDATED {participant.identity}: target_lang={target_lang}, user_lang={user_lang}"
+            pcm_data = await asyncio.get_event_loop().run_in_executor(
+                None, mp3_bytes_to_pcm, mp3_bytes
             )
 
-    def on_participant_connected(self, participant: rtc.RemoteParticipant):
-        logger.info(f"🟢 PARTICIPANT CONNECTED: {participant.identity}")
-        if (
-            participant.identity in self._speaker_sessions
-            or participant.identity.startswith("agent-")
-        ):
-            logger.info(f"⛔ SKIPPED: {participant.identity}")
-            return
+            FRAME_SIZE = LIVEKIT_SAMPLE_RATE // 10  # 100ms frames
+            frame_bytes = FRAME_SIZE * 2  # 16-bit
 
-        target_lang, voice_id, user_lang = self._parse_metadata(participant)
-        self._user_target_lang[participant.identity] = target_lang
-        self._user_voice[participant.identity] = voice_id
-        self._user_lang[participant.identity] = user_lang
+            for i in range(0, len(pcm_data), frame_bytes):
+                chunk = pcm_data[i : i + frame_bytes]
+                if len(chunk) < frame_bytes:
+                    chunk = chunk + b"\x00" * (frame_bytes - len(chunk))
 
-        listener = ListenerAudioPublisher(participant.identity, self.ctx.room, voice_id)
-        listener.update_settings(target_lang, voice_id)
-        self._listeners[participant.identity] = listener
+                frame = rtc.AudioFrame(
+                    data=chunk,
+                    sample_rate=LIVEKIT_SAMPLE_RATE,
+                    num_channels=LIVEKIT_CHANNELS,
+                    samples_per_channel=FRAME_SIZE,
+                )
+                await self._audio_source.capture_frame(frame)
 
-        task = asyncio.create_task(self._start_speaker_session(participant))
-        self._tasks.add(task)
-
-        def on_done(t: asyncio.Task):
-            try:
-                session, agent = t.result()
-                self._speaker_sessions[participant.identity] = session
-                self._speaker_agents[participant.identity] = agent
-                logger.info(f"✅ SESSION READY: {participant.identity}")
-            except Exception as e:
-                logger.error(f"Session failed for {participant.identity}: {e}")
-            finally:
-                self._tasks.discard(t)
-
-        task.add_done_callback(on_done)
-
-    def on_participant_disconnected(self, participant: rtc.RemoteParticipant):
-        logger.info(f"🔴 DISCONNECTED: {participant.identity}")
-        self._user_target_lang.pop(participant.identity, None)
-        self._user_voice.pop(participant.identity, None)
-        self._user_lang.pop(participant.identity, None)
-        self._listeners.pop(participant.identity, None)
-        self._speaker_agents.pop(participant.identity, None)
-
-        session = self._speaker_sessions.pop(participant.identity, None)
-        if session is None:
-            return
-        task = asyncio.create_task(self._close_session(session))
-        self._tasks.add(task)
-        task.add_done_callback(lambda _: self._tasks.discard(task))
-
-    async def handle_language_update(self, payload: bytes):
-        try:
-            data = json.loads(payload.decode("utf-8"))
-            identity = data.get("identity")
-            target_lang = data.get("target_lang", "no-translate")
-            voice_id = data.get("voice_id", DEFAULT_VOICE_ID)
-            logger.info(f"🌐 LANGUAGE UPDATE: {identity} -> {target_lang}")
-            if identity in self._listeners:
-                self._listeners[identity].update_settings(target_lang, voice_id)
-                self._user_target_lang[identity] = target_lang
         except Exception as e:
-            logger.error(f"Language update error: {e}")
+            logger.error(f"MP3 playback error for {self.participant.identity}: {e}")
 
-    async def on_transcript(self, speaker_identity: str, transcript: str):
-        logger.info(f"📩 TRANSCRIPT FROM: {speaker_identity} — {transcript!r}")
-
-        raw_identity = speaker_identity
-        clean_name = re.sub(r"_{2,}[a-zA-Z0-9]+$", "", raw_identity)
-
-        payload = {
-            "message": transcript,
-            "timestamp": int(time.time() * 1000),
-            "id": f"transcript-{raw_identity}-{time.time()}",
-            "from": {"identity": raw_identity, "name": clean_name, "isLocal": False},
-        }
-
+    async def _publish_transcript(self, msg: dict):
         try:
-            await self.ctx.room.local_participant.publish_data(
+            raw_identity = self.participant.identity
+            clean_name = re.sub(r"_{2,}[a-zA-Z0-9]+$", "", raw_identity)
+
+            payload = {
+                "message": msg.get("original", ""),
+                "translated": msg.get("translated", ""),
+                "target_language": msg.get("target_language", ""),
+                "timestamp": int(time.time() * 1000),
+                "id": f"transcript-{raw_identity}-{time.time()}",
+                "from": {
+                    "identity": raw_identity,
+                    "name": clean_name,
+                    "isLocal": False,
+                },
+            }
+
+            await self.room.local_participant.publish_data(
                 payload=json.dumps(payload).encode("utf-8"),
                 reliable=True,
                 topic="transcription_data",
             )
         except Exception as e:
-            logger.error(f"Failed to publish transcript: {e}")
+            logger.error(
+                f"Transcript publish error for {self.participant.identity}: {e}"
+            )
 
-        listeners_to_speak = [
-            listener
-            for identity, listener in self._listeners.items()
-            if identity != speaker_identity and listener.target_lang != "no-translate"
-        ]
-
-        logger.info(
-            f"🔊 LISTENERS TO SPEAK: {[l.participant_identity for l in listeners_to_speak]}"
-        )
-
-        if not listeners_to_speak:
+    def on_audio_frame(self, frame: rtc.AudioFrame):
+        """Feed raw PCM audio frames into the Voice API in 200ms chunks."""
+        if not self._voice_client:
             return
 
-        # Fire all listeners in parallel — no sequential waiting
-        await asyncio.gather(
-            *[listener.speak(transcript) for listener in listeners_to_speak],
-            return_exceptions=True,
+        self._pcm_buffer.extend(bytes(frame.data))
+
+        while len(self._pcm_buffer) >= CHUNK_SIZE:
+            chunk = bytes(self._pcm_buffer[:CHUNK_SIZE])
+            self._pcm_buffer = self._pcm_buffer[CHUNK_SIZE:]
+            self._voice_client.send_pcm(chunk)
+
+    async def update_settings(self, new_from_lang: str, new_target_lang: str):
+        logger.info(
+            f"Updating settings for {self.participant.identity}: {new_from_lang} -> {new_target_lang}"
         )
+        self.from_lang = new_from_lang
+        self.target_lang = new_target_lang
 
-    async def _start_speaker_session(self, participant: rtc.RemoteParticipant):
-        logger.info(f"⚙️ STARTING SESSION: {participant.identity}")
-        session = AgentSession()
-        user_lang = self._user_lang.get(participant.identity, "multi")
-        logger.info(f"🗣️ USER LANG for {participant.identity}: {user_lang}")
+        if new_target_lang and new_target_lang != "no-translate":
+            if self._voice_client:
+                self._voice_client.update_language(new_target_lang)
+            else:
+                self._init_voice_client()
+        else:
+            if self._voice_client:
+                self._voice_client.close()
+                self._voice_client = None
 
-        agent = SpeakerTranscriber(
-            participant_identity=participant.identity,
-            room=self.ctx.room,
-            on_transcript=self.on_transcript,
-            user_lang=user_lang,
+        await self._update_agent_metadata()
+
+    async def _update_agent_metadata(self):
+        agent_metadata = {
+            "is_agent": True,
+            "input_lang": self.from_lang,
+            "output_lang": self.target_lang,
+            "translated_user": self.participant.identity,
+        }
+        await self.room.local_participant.set_metadata(json.dumps(agent_metadata))
+        logger.info(f"Agent metadata updated for {self.participant.identity}")
+
+    async def start(self):
+        """Subscribe to participant's audio tracks."""
+
+        async def on_track_subscribed(track: rtc.Track, *_):
+            if track.kind == rtc.TrackKind.KIND_AUDIO:
+                task = asyncio.create_task(self._forward_audio(track))
+                self._audio_tasks.add(task)
+                task.add_done_callback(self._audio_tasks.discard)
+
+        self.participant.on("track_subscribed", on_track_subscribed)
+
+        # Handle already-subscribed tracks
+        for pub in self.participant.track_publications.values():
+            if pub.track and pub.track.kind == rtc.TrackKind.KIND_AUDIO:
+                task = asyncio.create_task(self._forward_audio(pub.track))
+                self._audio_tasks.add(task)
+                task.add_done_callback(self._audio_tasks.discard)
+
+        await self._update_agent_metadata()
+
+    async def _forward_audio(self, track: rtc.Track):
+        """Stream audio from LiveKit track → Voice API."""
+        logger.info(f"Audio forwarding started for {self.participant.identity}")
+        audio_stream = rtc.AudioStream(
+            track, sample_rate=API_SAMPLE_RATE, num_channels=1
         )
+        async for event in audio_stream:
+            self.on_audio_frame(event.frame)
 
-        room_io = RoomIO(
-            agent_session=session,
-            room=self.ctx.room,
+    def close(self):
+        for task in self._audio_tasks:
+            task.cancel()
+        if self._voice_client:
+            self._voice_client.close()
+
+
+class MultiUserTranscriber:
+    def __init__(self, ctx: JobContext):
+        self.ctx = ctx
+        self._transcribers: dict[str, ParticipantTranscriber] = {}
+        self._tasks: set[asyncio.Task] = set()
+        self._loop = asyncio.get_event_loop()
+
+    def start(self):
+        self.ctx.room.on("participant_connected", self.on_participant_connected)
+        self.ctx.room.on("participant_disconnected", self.on_participant_disconnected)
+        self.ctx.room.on("participant_metadata_changed", self.on_metadata_changed)
+
+    async def aclose(self):
+        self.ctx.room.off("participant_connected", self.on_participant_connected)
+        self.ctx.room.off("participant_disconnected", self.on_participant_disconnected)
+        self.ctx.room.off("participant_metadata_changed", self.on_metadata_changed)
+        await utils.aio.cancel_and_wait(*self._tasks)
+        for t in self._transcribers.values():
+            t.close()
+
+    def _parse_settings(self, participant: rtc.RemoteParticipant):
+        from_lang = "en"
+        target_lang = "no-translate"
+
+        if participant.metadata:
+            try:
+                metadata = json.loads(participant.metadata)
+                from_lang = metadata.get("user_lang", "en")
+                target_lang = metadata.get("target_lang", "no-translate")
+            except Exception as e:
+                logger.warning(f"Metadata parse error for {participant.identity}: {e}")
+
+        return from_lang, target_lang
+
+    def on_metadata_changed(self, participant: rtc.RemoteParticipant, _):
+        from_lang, target_lang = self._parse_settings(participant)
+        if participant.identity in self._transcribers:
+            t = self._transcribers[participant.identity]
+            asyncio.create_task(t.update_settings(from_lang, target_lang))
+
+    def on_participant_connected(self, participant: rtc.RemoteParticipant):
+        if (
+            participant.identity in self._transcribers
+            or participant.identity.startswith("agent-")
+        ):
+            return
+
+        from_lang, target_lang = self._parse_settings(participant)
+
+        transcriber = ParticipantTranscriber(
             participant=participant,
-            input_options=RoomInputOptions(text_enabled=False),
-            output_options=RoomOutputOptions(
-                transcription_enabled=True, audio_enabled=False
-            ),
+            room=self.ctx.room,
+            from_lang=from_lang,
+            target_lang=target_lang,
+            loop=self._loop,
         )
+        self._transcribers[participant.identity] = transcriber
 
-        await room_io.start()
-        await session.start(agent=agent)
-        logger.info(f"🚀 SESSION LIVE: {participant.identity}")
-        return session, agent
+        task = asyncio.create_task(transcriber.start())
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
-    async def _close_session(self, sess: AgentSession) -> None:
-        await sess.aclose()
-
-
-# ================================================================
-#  ENTRYPOINT
-# ================================================================
+    def on_participant_disconnected(self, participant: rtc.RemoteParticipant):
+        transcriber = self._transcribers.pop(participant.identity, None)
+        if transcriber:
+            transcriber.close()
 
 
 async def entrypoint(ctx: JobContext):
-    logger.info("🚀 ENTRYPOINT STARTED")
-    manager = MultiUserTranslationManager(ctx)
+    ctx.room.close_on_disconnect = True
 
-    def on_data_received(data_packet):
-        try:
-            topic = data_packet.topic
-            payload = bytes(data_packet.data)
-            if topic != "language_update":
-                return
-            asyncio.create_task(manager.handle_language_update(payload))
-        except Exception as e:
-            logger.error(f"data_received error: {e}")
-
-    ctx.room.on("participant_connected", manager.on_participant_connected)
-    ctx.room.on("participant_disconnected", manager.on_participant_disconnected)
-    ctx.room.on("participant_metadata_changed", manager.on_metadata_changed)
-    ctx.room.on("data_received", on_data_received)
+    transcriber = MultiUserTranscriber(ctx)
+    transcriber.start()
 
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-    logger.info("✅ CONNECTED TO LIVEKIT")
 
     for p in ctx.room.remote_participants.values():
-        manager.on_participant_connected(p)
+        transcriber.on_participant_connected(p)
 
     while True:
         await asyncio.sleep(1)
 
 
-# ================================================================
-#  MAIN
-# ================================================================
-
 if __name__ == "__main__":
-    threading.Thread(target=run_health_server, daemon=True).start()
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
