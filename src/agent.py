@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import json
+import os
 import time
 import re
 import threading
@@ -20,9 +21,25 @@ import av
 import io
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+# Without a configured handler, plain `logger.info(...)` calls may not show
+# up in the console at all (root logger defaults to WARNING). This makes
+# sure every join/leave/AI-mode/error event is actually visible.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
 logger = logging.getLogger("transcriber")
 
-VOICE_API_URL = "wss://voice-agent-437894783947.us-central1.run.app/ws/stream"
+VOICE_API_URL = os.getenv("VOICE_API_URL")
+if not VOICE_API_URL:
+    raise RuntimeError("VOICE_API_URL is not set in environment (.env)")
+
+logger.info(f"Voice API URL loaded from environment: {VOICE_API_URL}")
 
 LANG_CODE_TO_NAME = {
     "en": "English",
@@ -96,10 +113,17 @@ def mp3_bytes_to_pcm(
 class VoiceAPIClient:
     """Persistent WebSocket connection to the Voice Translator API for one participant."""
 
-    def __init__(self, target_lang: str, on_mp3: callable, on_transcript: callable):
+    def __init__(
+        self,
+        target_lang: str,
+        on_mp3: callable,
+        on_transcript: callable,
+        owner_identity: str = "unknown",
+    ):
         self._target_lang = target_lang
         self._on_mp3 = on_mp3
         self._on_transcript = on_transcript
+        self._owner_identity = owner_identity  # only used for clearer logs
         self._ws: websocket.WebSocket | None = None
         self._ready = threading.Event()
         self._closed = False
@@ -107,20 +131,33 @@ class VoiceAPIClient:
         self._lock = threading.Lock()
 
     def start(self):
+        logger.info(
+            f"[{self._owner_identity}] Starting VoiceAPI connection thread "
+            f"(target_lang={self._target_lang})"
+        )
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        self._ready.wait(timeout=10)
+        ok = self._ready.wait(timeout=10)
+        if not ok:
+            logger.warning(
+                f"[{self._owner_identity}] VoiceAPI did not become ready within timeout"
+            )
 
     def _run(self):
         try:
+            logger.info(
+                f"[{self._owner_identity}] Connecting to VoiceAPI: {VOICE_API_URL}"
+            )
             self._ws = websocket.create_connection(VOICE_API_URL)
-            logger.info("VoiceAPI WS connected")
+            logger.info(f"[{self._owner_identity}] VoiceAPI WS connected")
 
             # Wait for ready signal
             raw = self._ws.recv()
             msg = json.loads(raw)
             if msg.get("type") == "ready":
-                logger.info(f"VoiceAPI ready, client_id={msg.get('client_id')}")
+                logger.info(
+                    f"[{self._owner_identity}] VoiceAPI ready, client_id={msg.get('client_id')}"
+                )
 
             # Set output language
             lang_name = LANG_CODE_TO_NAME.get(self._target_lang, self._target_lang)
@@ -130,7 +167,9 @@ class VoiceAPIClient:
             raw = self._ws.recv()
             msg = json.loads(raw)
             if msg.get("type") == "language_set":
-                logger.info(f"VoiceAPI language set to: {msg.get('language')}")
+                logger.info(
+                    f"[{self._owner_identity}] VoiceAPI language set to: {msg.get('language')}"
+                )
 
             self._ready.set()
 
@@ -142,27 +181,48 @@ class VoiceAPIClient:
                 try:
                     data = self._ws.recv()
                     if isinstance(data, bytes):
+                        logger.debug(
+                            f"[{self._owner_identity}] Received MP3 audio chunk "
+                            f"({len(data)} bytes)"
+                        )
                         self._on_mp3(data)
                     else:
                         msg = json.loads(data)
                         msg_type = msg.get("type")
                         if msg_type == "transcript":
+                            logger.info(
+                                f"[{self._owner_identity}] Transcript received: "
+                                f"original='{msg.get('original', '')[:60]}' "
+                                f"translated='{msg.get('translated', '')[:60]}'"
+                            )
                             self._on_transcript(msg)
                         elif msg_type == "pong":
-                            pass
+                            logger.debug(
+                                f"[{self._owner_identity}] Keepalive pong received"
+                            )
                         elif msg_type == "processing":
-                            logger.debug("VoiceAPI processing...")
+                            logger.debug(
+                                f"[{self._owner_identity}] VoiceAPI processing..."
+                            )
                         elif msg_type == "error":
-                            logger.error(f"VoiceAPI error: {msg.get('message')}")
+                            logger.error(
+                                f"[{self._owner_identity}] VoiceAPI error: {msg.get('message')}"
+                            )
                         else:
-                            logger.debug(f"VoiceAPI msg: {msg}")
+                            logger.debug(
+                                f"[{self._owner_identity}] VoiceAPI msg: {msg}"
+                            )
                 except Exception as e:
                     if not self._closed:
-                        logger.error(f"VoiceAPI recv error: {e}")
+                        logger.error(
+                            f"[{self._owner_identity}] VoiceAPI recv error: {e}"
+                        )
                     break
 
+            logger.info(f"[{self._owner_identity}] VoiceAPI receive loop ended")
+
         except Exception as e:
-            logger.error(f"VoiceAPI connection failed: {e}")
+            logger.error(f"[{self._owner_identity}] VoiceAPI connection failed: {e}")
             self._ready.set()  # unblock even on failure
 
     def _keepalive(self):
@@ -172,8 +232,9 @@ class VoiceAPIClient:
                 with self._lock:
                     if self._ws and not self._closed:
                         self._ws.send(json.dumps({"type": "ping"}))
+                        logger.debug(f"[{self._owner_identity}] Keepalive ping sent")
             except Exception as e:
-                logger.warning(f"Keepalive ping failed: {e}")
+                logger.warning(f"[{self._owner_identity}] Keepalive ping failed: {e}")
                 break
 
     def send_pcm(self, pcm_bytes: bytes):
@@ -182,17 +243,19 @@ class VoiceAPIClient:
                 if self._ws and not self._closed:
                     self._ws.send_binary(pcm_bytes)
         except Exception as e:
-            logger.error(f"VoiceAPI send_pcm error: {e}")
+            logger.error(f"[{self._owner_identity}] VoiceAPI send_pcm error: {e}")
 
     def flush(self):
         try:
             with self._lock:
                 if self._ws and not self._closed:
                     self._ws.send(json.dumps({"type": "flush"}))
+                    logger.info(f"[{self._owner_identity}] VoiceAPI flush sent")
         except Exception as e:
-            logger.error(f"VoiceAPI flush error: {e}")
+            logger.error(f"[{self._owner_identity}] VoiceAPI flush error: {e}")
 
     def update_language(self, new_target_lang: str):
+        old_lang = self._target_lang
         self._target_lang = new_target_lang
         lang_name = LANG_CODE_TO_NAME.get(new_target_lang, new_target_lang)
         try:
@@ -201,11 +264,17 @@ class VoiceAPIClient:
                     self._ws.send(
                         json.dumps({"type": "set_language", "language": lang_name})
                     )
-                    logger.info(f"VoiceAPI language updated to: {lang_name}")
+                    logger.info(
+                        f"[{self._owner_identity}] VoiceAPI language updated: "
+                        f"{old_lang} -> {new_target_lang} ({lang_name})"
+                    )
         except Exception as e:
-            logger.error(f"VoiceAPI update_language error: {e}")
+            logger.error(
+                f"[{self._owner_identity}] VoiceAPI update_language error: {e}"
+            )
 
     def close(self):
+        logger.info(f"[{self._owner_identity}] Closing VoiceAPI connection")
         self._closed = True
         try:
             if self._ws:
@@ -242,14 +311,23 @@ class ParticipantTranscriber:
         )
         self._track_published = False
 
+        logger.info(
+            f"[{participant.identity}] Transcriber created "
+            f"(from_lang={from_lang}, target_lang={target_lang})"
+        )
+
         if target_lang and target_lang != "no-translate":
+            logger.info(f"[{participant.identity}] AI translation is ON at startup")
             self._init_voice_client()
+        else:
+            logger.info(f"[{participant.identity}] AI translation is OFF at startup")
 
     def _init_voice_client(self):
         self._voice_client = VoiceAPIClient(
             target_lang=self.target_lang,
             on_mp3=self._on_mp3_received,
             on_transcript=self._on_transcript_received,
+            owner_identity=self.participant.identity,
         )
         self._voice_client.start()
 
@@ -264,9 +342,16 @@ class ParticipantTranscriber:
             if not self._track_published:
                 await self.room.local_participant.publish_track(self._track)
                 self._track_published = True
+                logger.info(
+                    f"[{self.participant.identity}] Translation audio track published"
+                )
 
             pcm_data = await asyncio.get_event_loop().run_in_executor(
                 None, mp3_bytes_to_pcm, mp3_bytes
+            )
+            logger.debug(
+                f"[{self.participant.identity}] Decoded MP3 -> PCM "
+                f"({len(pcm_data)} bytes), playing back"
             )
 
             FRAME_SIZE = LIVEKIT_SAMPLE_RATE // 10  # 100ms frames
@@ -286,7 +371,7 @@ class ParticipantTranscriber:
                 await self._audio_source.capture_frame(frame)
 
         except Exception as e:
-            logger.error(f"MP3 playback error for {self.participant.identity}: {e}")
+            logger.error(f"[{self.participant.identity}] MP3 playback error: {e}")
 
     async def _publish_transcript(self, msg: dict):
         try:
@@ -311,10 +396,12 @@ class ParticipantTranscriber:
                 reliable=True,
                 topic="transcription_data",
             )
-        except Exception as e:
-            logger.error(
-                f"Transcript publish error for {self.participant.identity}: {e}"
+            logger.info(
+                f"[{raw_identity}] Transcript published to room "
+                f"(lang={payload['target_language']})"
             )
+        except Exception as e:
+            logger.error(f"[{self.participant.identity}] Transcript publish error: {e}")
 
     def on_audio_frame(self, frame: rtc.AudioFrame):
         """Feed raw PCM audio frames into the Voice API in 200ms chunks."""
@@ -329,19 +416,38 @@ class ParticipantTranscriber:
             self._voice_client.send_pcm(chunk)
 
     async def update_settings(self, new_from_lang: str, new_target_lang: str):
+        old_from_lang = self.from_lang
+        old_target_lang = self.target_lang
+
+        was_on = bool(old_target_lang and old_target_lang != "no-translate")
+        will_be_on = bool(new_target_lang and new_target_lang != "no-translate")
+
         logger.info(
-            f"Updating settings for {self.participant.identity}: {new_from_lang} -> {new_target_lang}"
+            f"[{self.participant.identity}] Settings update requested: "
+            f"from_lang {old_from_lang} -> {new_from_lang}, "
+            f"target_lang {old_target_lang} -> {new_target_lang}"
         )
+
         self.from_lang = new_from_lang
         self.target_lang = new_target_lang
 
-        if new_target_lang and new_target_lang != "no-translate":
+        if will_be_on:
             if self._voice_client:
+                if not was_on:
+                    logger.info(
+                        f"[{self.participant.identity}] AI translation turned ON "
+                        f"(target={new_target_lang})"
+                    )
                 self._voice_client.update_language(new_target_lang)
             else:
+                logger.info(
+                    f"[{self.participant.identity}] AI translation turned ON "
+                    f"(target={new_target_lang})"
+                )
                 self._init_voice_client()
         else:
             if self._voice_client:
+                logger.info(f"[{self.participant.identity}] AI translation turned OFF")
                 self._voice_client.close()
                 self._voice_client = None
 
@@ -355,13 +461,17 @@ class ParticipantTranscriber:
             "translated_user": self.participant.identity,
         }
         await self.room.local_participant.set_metadata(json.dumps(agent_metadata))
-        logger.info(f"Agent metadata updated for {self.participant.identity}")
+        logger.info(
+            f"[{self.participant.identity}] Agent metadata updated "
+            f"(input_lang={self.from_lang}, output_lang={self.target_lang})"
+        )
 
     async def start(self):
         """Subscribe to participant's audio tracks."""
 
         async def on_track_subscribed(track: rtc.Track, *_):
             if track.kind == rtc.TrackKind.KIND_AUDIO:
+                logger.info(f"[{self.participant.identity}] Audio track subscribed")
                 task = asyncio.create_task(self._forward_audio(track))
                 self._audio_tasks.add(task)
                 task.add_done_callback(self._audio_tasks.discard)
@@ -371,6 +481,9 @@ class ParticipantTranscriber:
         # Handle already-subscribed tracks
         for pub in self.participant.track_publications.values():
             if pub.track and pub.track.kind == rtc.TrackKind.KIND_AUDIO:
+                logger.info(
+                    f"[{self.participant.identity}] Existing audio track found, subscribing"
+                )
                 task = asyncio.create_task(self._forward_audio(pub.track))
                 self._audio_tasks.add(task)
                 task.add_done_callback(self._audio_tasks.discard)
@@ -379,14 +492,18 @@ class ParticipantTranscriber:
 
     async def _forward_audio(self, track: rtc.Track):
         """Stream audio from LiveKit track → Voice API."""
-        logger.info(f"Audio forwarding started for {self.participant.identity}")
+        logger.info(f"[{self.participant.identity}] Audio forwarding started")
         audio_stream = rtc.AudioStream(
             track, sample_rate=API_SAMPLE_RATE, num_channels=1
         )
-        async for event in audio_stream:
-            self.on_audio_frame(event.frame)
+        try:
+            async for event in audio_stream:
+                self.on_audio_frame(event.frame)
+        finally:
+            logger.info(f"[{self.participant.identity}] Audio forwarding stopped")
 
     def close(self):
+        logger.info(f"[{self.participant.identity}] Closing transcriber")
         for task in self._audio_tasks:
             task.cancel()
         if self._voice_client:
@@ -404,6 +521,7 @@ class MultiUserTranscriber:
         self.ctx.room.on("participant_connected", self.on_participant_connected)
         self.ctx.room.on("participant_disconnected", self.on_participant_disconnected)
         self.ctx.room.on("participant_metadata_changed", self.on_metadata_changed)
+        logger.info("MultiUserTranscriber started, listening for room events")
 
     async def aclose(self):
         self.ctx.room.off("participant_connected", self.on_participant_connected)
@@ -412,6 +530,7 @@ class MultiUserTranscriber:
         await utils.aio.cancel_and_wait(*self._tasks)
         for t in self._transcribers.values():
             t.close()
+        logger.info("MultiUserTranscriber closed")
 
     def _parse_settings(self, participant: rtc.RemoteParticipant):
         from_lang = "en"
@@ -423,24 +542,45 @@ class MultiUserTranscriber:
                 from_lang = metadata.get("user_lang", "en")
                 target_lang = metadata.get("target_lang", "no-translate")
             except Exception as e:
-                logger.warning(f"Metadata parse error for {participant.identity}: {e}")
+                logger.warning(f"[{participant.identity}] Metadata parse error: {e}")
 
         return from_lang, target_lang
 
     def on_metadata_changed(self, participant: rtc.RemoteParticipant, _):
         from_lang, target_lang = self._parse_settings(participant)
+        logger.info(
+            f"[{participant.identity}] Metadata changed -> "
+            f"from_lang={from_lang}, target_lang={target_lang}"
+        )
         if participant.identity in self._transcribers:
             t = self._transcribers[participant.identity]
             asyncio.create_task(t.update_settings(from_lang, target_lang))
+        else:
+            logger.warning(
+                f"[{participant.identity}] Metadata changed but no transcriber exists for them"
+            )
 
     def on_participant_connected(self, participant: rtc.RemoteParticipant):
-        if (
-            participant.identity in self._transcribers
-            or participant.identity.startswith("agent-")
-        ):
+        logger.info(f"👤 Participant joined: {participant.identity}")
+
+        if participant.identity.startswith("agent-"):
+            logger.info(
+                f"[{participant.identity}] Skipping (this is an agent identity)"
+            )
+            return
+
+        if participant.identity in self._transcribers:
+            logger.info(
+                f"[{participant.identity}] Transcriber already exists, skipping setup"
+            )
             return
 
         from_lang, target_lang = self._parse_settings(participant)
+        ai_status = "ON" if target_lang and target_lang != "no-translate" else "OFF"
+        logger.info(
+            f"[{participant.identity}] Initial settings: from_lang={from_lang}, "
+            f"target_lang={target_lang} (AI translation {ai_status})"
+        )
 
         transcriber = ParticipantTranscriber(
             participant=participant,
@@ -455,25 +595,47 @@ class MultiUserTranscriber:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+        logger.info(
+            f"[{participant.identity}] Transcriber registered "
+            f"(total active: {len(self._transcribers)})"
+        )
+
     def on_participant_disconnected(self, participant: rtc.RemoteParticipant):
+        logger.info(f"🚪 Participant left: {participant.identity}")
         transcriber = self._transcribers.pop(participant.identity, None)
         if transcriber:
             transcriber.close()
+            logger.info(
+                f"[{participant.identity}] Transcriber removed "
+                f"(remaining active: {len(self._transcribers)})"
+            )
+        else:
+            logger.warning(
+                f"[{participant.identity}] Disconnected but no transcriber was tracked for them"
+            )
 
 
 async def entrypoint(ctx: JobContext):
+    logger.info(f"=== Agent job starting | room={ctx.room.name} ===")
     ctx.room.close_on_disconnect = True
 
     transcriber = MultiUserTranscriber(ctx)
     transcriber.start()
 
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    logger.info(f"Connected to LiveKit room: {ctx.room.name}")
 
-    for p in ctx.room.remote_participants.values():
+    existing = list(ctx.room.remote_participants.values())
+    logger.info(f"Found {len(existing)} participant(s) already in the room")
+    for p in existing:
         transcriber.on_participant_connected(p)
 
-    while True:
-        await asyncio.sleep(1)
+    try:
+        while True:
+            await asyncio.sleep(1)
+    finally:
+        logger.info(f"=== Agent job ending | room={ctx.room.name} ===")
+        await transcriber.aclose()
 
 
 if __name__ == "__main__":
