@@ -1,5 +1,5 @@
 # ============================================================
-#  agent.py — LiveKit Multi-User Personalized Translator (FIXED)
+#  PRODUCTION FIXED LiveKit Translator (VoiceAPI)
 # ============================================================
 
 import asyncio
@@ -7,110 +7,82 @@ import logging
 import json
 import os
 import time
-import re
-import threading
 import base64
+import threading
 import websocket
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from dotenv import load_dotenv
 
+from dotenv import load_dotenv
 from livekit import rtc
-from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli, utils
+from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli
 
 load_dotenv()
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("transcriber")
 
 VOICE_API_URL = os.getenv("VOICE_API_URL")
-if not VOICE_API_URL:
-    raise RuntimeError("VOICE_API_URL is not set")
-
-LANG_CODE_TO_NAME = {
-    "en": "English",
-    "bn": "Bengali",
-    "fr": "French",
-    "ar": "Arabic",
-    "hi": "Hindi",
-    "es": "Spanish",
-}
 
 API_SAMPLE_RATE = 16000
-CHUNK_SIZE = int(API_SAMPLE_RATE * 0.2) * 2  # 200ms PCM
+CHUNK_MS = 100
+CHUNK_SIZE = int(API_SAMPLE_RATE * (CHUNK_MS / 1000)) * 2
 
 
-# ================================================================
+# ============================================================
 # Voice API CLIENT
-# ================================================================
+# ============================================================
 class VoiceAPIClient:
-    def __init__(self, target_lang, on_mp3, on_transcript, owner_label="unknown"):
-        self._target_lang = target_lang
-        self._on_mp3 = on_mp3
-        self._on_transcript = on_transcript
-        self._owner_label = owner_label
-        self._ws = None
-        self._ready = threading.Event()
-        self._closed = False
-        self._lock = threading.Lock()
+    def __init__(self, lang, on_mp3, on_transcript, label=""):
+        self.lang = lang
+        self.on_mp3 = on_mp3
+        self.on_transcript = on_transcript
+        self.label = label
+
+        self.ws = None
+        self.closed = False
+        self.lock = threading.Lock()
 
     def start(self):
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        self._ready.wait(timeout=10)
+        threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
         try:
-            self._ws = websocket.create_connection(VOICE_API_URL)
+            self.ws = websocket.create_connection(VOICE_API_URL)
 
-            raw = self._ws.recv()
-            msg = json.loads(raw)
+            self.ws.send(json.dumps({"type": "set_language", "language": self.lang}))
 
-            lang_name = LANG_CODE_TO_NAME.get(self._target_lang, self._target_lang)
-            self._ws.send(json.dumps({"type": "set_language", "language": lang_name}))
+            while not self.closed:
+                msg = self.ws.recv()
 
-            self._ready.set()
-
-            while not self._closed:
-                data = self._ws.recv()
-
-                if isinstance(data, bytes):
-                    self._on_mp3(data)
+                if isinstance(msg, bytes):
+                    self.on_mp3(msg)
                 else:
-                    msg = json.loads(data)
-
-                    if msg.get("type") == "transcript":
-                        self._on_transcript(msg)
+                    data = json.loads(msg)
+                    if data.get("type") == "transcript":
+                        self.on_transcript(data)
 
         except Exception as e:
-            logger.error(f"[{self._owner_label}] VoiceAPI error: {e}")
+            logger.error(f"[VoiceAPI] {self.label} error: {e}")
 
-    def send_pcm(self, pcm_bytes: bytes):
+    def send_pcm(self, pcm: bytes):
         try:
-            with self._lock:
-                if self._ws:
-                    self._ws.send_binary(pcm_bytes)
-        except Exception as e:
-            logger.error(f"[send_pcm error] {e}")
+            with self.lock:
+                if self.ws:
+                    self.ws.send_binary(pcm)
+        except:
+            pass
 
     def close(self):
-        self._closed = True
+        self.closed = True
         try:
-            if self._ws:
-                self._ws.close()
+            if self.ws:
+                self.ws.close()
         except:
             pass
 
 
-# ================================================================
+# ============================================================
 # SPEAKER PIPELINE
-# ================================================================
+# ============================================================
 class SpeakerPipeline:
     def __init__(self, participant, room, manager, loop):
         self.participant = participant
@@ -118,162 +90,162 @@ class SpeakerPipeline:
         self.manager = manager
         self.loop = loop
 
-        self._pcm_buffer = bytearray()
-        self._lang_clients = {}
-        self._primary_lang = None
-        self._audio_tasks = set()
-        self._subscribed = set()
+        self.buffer = bytearray()
+        self.clients = {}
+        self.primary_lang = None
+        self.last_flush = time.time()
 
-    # ---------------- FIX 1: STABLE AUDIO BUFFER ----------------
-    def _on_audio_frame(self, frame: rtc.AudioFrame):
-        if not self._lang_clients:
+    # AUDIO STREAM
+    def on_audio_frame(self, frame: rtc.AudioFrame):
+        if not self.clients:
             return
 
-        self._pcm_buffer.extend(bytes(frame.data))
+        self.buffer.extend(bytes(frame.data))
 
-        if len(self._pcm_buffer) >= CHUNK_SIZE:
-            chunk = bytes(self._pcm_buffer)
-            self._pcm_buffer.clear()
+        now = time.time()
 
-            for client in list(self._lang_clients.values()):
-                client.send_pcm(chunk)
+        if len(self.buffer) >= CHUNK_SIZE or (now - self.last_flush) > 0.1:
+            chunk = bytes(self.buffer)
+            self.buffer.clear()
+            self.last_flush = now
 
-    # ---------------- TRACK ----------------
-    def handle_track_subscribed(self, track: rtc.Track):
-        if track.sid in self._subscribed:
-            return
+            for c in self.clients.values():
+                c.send_pcm(chunk)
 
-        self._subscribed.add(track.sid)
+    # TRACK HANDLER (FIXED)
+    def handle_track(self, track: rtc.Track):
         asyncio.create_task(self._forward(track))
 
     async def _forward(self, track):
         stream = rtc.AudioStream(track, sample_rate=API_SAMPLE_RATE)
 
-        async for event in stream:
-            self._on_audio_frame(event.frame)
+        async for ev in stream:
+            self.on_audio_frame(ev.frame)
 
-    # ---------------- FIX 2: SAFE HANDLERS ----------------
-    def make_mp3_handler(self, lang):
-        return lambda data: self._on_mp3(lang, data)
+    # CALLBACK WRAPPERS
+    def mp3_handler(self, lang):
+        return lambda data: self._mp3(lang, data)
 
-    def make_transcript_handler(self, lang):
-        return lambda msg: self._on_transcript(lang, msg)
+    def transcript_handler(self, lang):
+        return lambda msg: self._transcript(lang, msg)
 
-    def _on_mp3(self, lang, data):
+    def _mp3(self, lang, data):
         asyncio.run_coroutine_threadsafe(self._deliver(lang, data), self.loop)
 
-    def _on_transcript(self, lang, msg):
+    def _transcript(self, lang, msg):
         asyncio.run_coroutine_threadsafe(self._caption(lang, msg), self.loop)
 
     async def _deliver(self, lang, data):
-        listeners = self.manager.listeners_for_lang(lang, self.participant.identity)
+        listeners = self.manager.listeners(lang, self.participant.identity)
         if not listeners:
-            return
-
-        payload = json.dumps(
-            {
-                "type": "audio",
-                "lang": lang,
-                "audio_b64": base64.b64encode(data).decode(),
-            }
-        ).encode()
-
-        await self.room.local_participant.publish_data(
-            payload, reliable=True, destination_identities=listeners
-        )
-
-    async def _caption(self, lang, msg):
-        if lang != self._primary_lang:
             return
 
         await self.room.local_participant.publish_data(
             json.dumps(
                 {
-                    "type": "caption",
-                    "text": msg.get("original", ""),
+                    "type": "audio",
+                    "lang": lang,
+                    "audio": base64.b64encode(data).decode(),
                 }
             ).encode(),
             reliable=True,
+            destination_identities=listeners,
         )
 
-    # ---------------- LANG RECONCILE ----------------
-    def reconcile_langs(self, needed):
-        removed = set(self._lang_clients) - needed
-        added = needed - set(self._lang_clients)
+    async def _caption(self, lang, msg):
+        if lang != self.primary_lang:
+            return
 
-        for lang in removed:
-            self._lang_clients.pop(lang).close()
+        await self.room.local_participant.publish_data(
+            json.dumps({"type": "caption", "text": msg.get("original", "")}).encode(),
+            reliable=True,
+        )
 
-        for lang in added:
+    # LANGUAGE CONTROL
+    def reconcile(self, needed):
+        remove = set(self.clients) - needed
+        add = needed - set(self.clients)
+
+        for l in remove:
+            self.clients.pop(l).close()
+
+        for l in add:
             client = VoiceAPIClient(
-                target_lang=lang,
-                on_mp3=self.make_mp3_handler(lang),
-                on_transcript=self.make_transcript_handler(lang),
-                owner_label=f"{self.participant.identity}->{lang}",
+                l,
+                self.mp3_handler(l),
+                self.transcript_handler(l),
+                label=f"{self.participant.identity}->{l}",
             )
-            self._lang_clients[lang] = client
-            self.loop.run_in_executor(None, client.start)
+            self.clients[l] = client
+            self.loop.call_soon_threadsafe(client.start)
 
-        if not self._primary_lang and self._lang_clients:
-            self._primary_lang = next(iter(self._lang_clients))
+        if not self.primary_lang and self.clients:
+            self.primary_lang = next(iter(self.clients))
 
 
-# ================================================================
-# MANAGER
-# ================================================================
-class MultiUserTranslationManager:
+# ============================================================
+# MANAGER (FIXED)
+# ============================================================
+class Manager:
     def __init__(self, ctx):
         self.ctx = ctx
         self.pipelines = {}
-        self.listener_targets = {}
+        self.listeners_map = {}
         self.loop = asyncio.get_event_loop()
 
-    def listeners_for_lang(self, lang, exclude):
-        return [
-            i for i, l in self.listener_targets.items() if l == lang and i != exclude
-        ]
+    def listeners(self, lang, exclude):
+        return [i for i, l in self.listeners_map.items() if l == lang and i != exclude]
 
-    def _recompute(self):
-        self.listener_targets.clear()
+    def recompute(self):
+        self.listeners_map.clear()
 
-        for ident, p in self.ctx.room.remote_participants.items():
+        for i, p in self.ctx.room.remote_participants.items():
             try:
-                meta = json.loads(p.metadata or "{}")
-                lang = meta.get("target_lang")
+                m = json.loads(p.metadata or "{}")
+                lang = m.get("target_lang")
                 if lang and lang != "no-translate":
-                    self.listener_targets[ident] = lang
+                    self.listeners_map[i] = lang
             except:
                 pass
 
-    def _reconcile(self):
-        self._recompute()
+    def reconcile_all(self):
+        self.recompute()
 
-        for ident, pipeline in self.pipelines.items():
-            needed = {lang for i, lang in self.listener_targets.items() if i != ident}
-            pipeline.reconcile_langs(needed)
+        for i, pipe in self.pipelines.items():
+            needed = {lang for x, lang in self.listeners_map.items() if x != i}
+            pipe.reconcile(needed)
 
-    def on_participant_connected(self, p):
+    # FIXED: NO create_task here
+    def on_join(self, p):
         if p.identity.startswith("agent-"):
             return
 
-        pipeline = SpeakerPipeline(p, self.ctx.room, self, self.loop)
-        self.pipelines[p.identity] = pipeline
-        asyncio.create_task(pipeline.handle_track_subscribed)
+        pipe = SpeakerPipeline(p, self.ctx.room, self, self.loop)
+        self.pipelines[p.identity] = pipe
 
-        self._reconcile()
+        self.reconcile_all()
 
-    def on_metadata_changed(self, p, _):
-        self._reconcile()
+    def on_meta(self, p, _):
+        self.reconcile_all()
+
+    # FIXED: THIS WAS MISSING BEFORE
+    def on_track(self, track, pub, participant):
+        pipe = self.pipelines.get(participant.identity)
+        if pipe:
+            pipe.handle_track(track)
 
 
-# ================================================================
-# ENTRY
-# ================================================================
+# ============================================================
+# ENTRYPOINT
+# ============================================================
 async def entrypoint(ctx: JobContext):
-    manager = MultiUserTranslationManager(ctx)
+    m = Manager(ctx)
 
-    ctx.room.on("participant_connected", manager.on_participant_connected)
-    ctx.room.on("participant_metadata_changed", manager.on_metadata_changed)
+    ctx.room.on("participant_connected", m.on_join)
+    ctx.room.on("participant_metadata_changed", m.on_meta)
+
+    # 🔥 IMPORTANT FIX
+    ctx.room.on("track_subscribed", m.on_track)
 
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
