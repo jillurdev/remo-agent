@@ -17,42 +17,59 @@ target_languages = {}  # participant_sid -> lang_code
 
 
 async def entrypoint(ctx: JobContext):
-    logger.info(f"Connecting to room {ctx.room.name}")
+    logger.info(f"🤖 AI agent joining room: {ctx.room.name}")
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    logger.info(f"✅ AI agent connected to room: {ctx.room.name}")
 
     from livekit.plugins import silero
 
     silero.VAD.load()
+    logger.info("🔊 VAD (voice activity detection) model loaded")
+
+    def _lang_from_metadata(metadata: str | None, field: str, default: str) -> str:
+        if not metadata:
+            return default
+        try:
+            return json.loads(metadata).get(field, default)
+        except Exception:
+            return default
 
     def update_pipelines():
         active_langs = set(target_languages.values())
         for sp_sid, sp in speaker_pipelines.items():
             for lang in list(sp.language_pipelines.keys()):
                 if lang not in active_langs:
+                    logger.info(
+                        f"🌐 No more listeners for '{lang}' from {sp.speaker.identity} — stopping that translation pipeline"
+                    )
                     asyncio.create_task(sp.remove_language(lang))
             for lang in active_langs:
                 source_lang = sp._get_source_lang()
-                if lang != source_lang and lang != "no-translate":
+                if (
+                    lang != source_lang
+                    and lang != "no-translate"
+                    and lang not in sp.language_pipelines
+                ):
+                    logger.info(
+                        f"🌐 Starting translation pipeline for {sp.speaker.identity}: {source_lang} -> {lang}"
+                    )
                     asyncio.create_task(sp.ensure_language(lang))
 
     @ctx.room.on("participant_connected")
     def on_participant_connected(participant: rtc.RemoteParticipant):
-        logger.info(f"Participant connected: {participant.identity}")
+        lang = _lang_from_metadata(participant.metadata, "target_lang", "no-translate")
+        spoken_lang = _lang_from_metadata(participant.metadata, "user_lang", "en")
+        logger.info(
+            f"👤 Participant joined: {participant.identity}  "
+            f"(speaks: {spoken_lang}, wants to hear: {lang})"
+        )
         speaker_pipelines[participant.sid] = SpeakerPipeline(participant, ctx.room)
-
-        lang = "no-translate"
-        if participant.metadata:
-            try:
-                meta = json.loads(participant.metadata)
-                lang = meta.get("target_lang", "no-translate")
-            except:
-                pass
         target_languages[participant.sid] = lang
         update_pipelines()
 
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
-        logger.info(f"Participant disconnected: {participant.identity}")
+        logger.info(f"👋 Participant left: {participant.identity}")
         if participant.sid in speaker_pipelines:
             sp = speaker_pipelines.pop(participant.sid)
             asyncio.create_task(sp.shutdown())
@@ -69,7 +86,7 @@ async def entrypoint(ctx: JobContext):
     ):
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             if participant.sid in speaker_pipelines:
-                logger.info(f"Subscribed to audio track for {participant.identity}")
+                logger.info(f"🎙️  Listening to {participant.identity}'s microphone")
                 asyncio.create_task(
                     speaker_pipelines[participant.sid].set_speaker_track(track)
                 )
@@ -78,16 +95,13 @@ async def entrypoint(ctx: JobContext):
     def on_participant_metadata_changed(
         participant: rtc.RemoteParticipant, old_metadata: str
     ):
-        logger.info(f"Participant metadata changed for {participant.identity}")
-        lang = "no-translate"
-        if participant.metadata:
-            try:
-                meta = json.loads(participant.metadata)
-                lang = meta.get("target_lang", "no-translate")
-            except:
-                pass
+        lang = _lang_from_metadata(participant.metadata, "target_lang", "no-translate")
 
         if target_languages.get(participant.sid) != lang:
+            logger.info(
+                f"🔄 {participant.identity} changed their listening language: "
+                f"{target_languages.get(participant.sid)} -> {lang}"
+            )
             target_languages[participant.sid] = lang
             update_pipelines()
 
@@ -100,13 +114,14 @@ async def entrypoint(ctx: JobContext):
     try:
         await asyncio.Event().wait()
     finally:
+        logger.info(f"🛑 Agent shutting down for room: {ctx.room.name}")
         for sp in speaker_pipelines.values():
             await sp.shutdown()
 
 
 async def request_fnc(req: JobRequest) -> None:
-    logger.info(f"Accepting job for room {req.room.name}")
-    await req.accept(entrypoint)
+    logger.info(f"📥 Job request received for room: {req.room.name}")
+    await req.accept()
 
 
 if __name__ == "__main__":

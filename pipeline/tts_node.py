@@ -1,7 +1,6 @@
 import asyncio
 from livekit import rtc
 from livekit.plugins import cartesia
-from livekit.agents import tts
 from utils.logger import logger
 
 
@@ -31,11 +30,13 @@ class TTSNode:
             self._audio_source = rtc.AudioSource(
                 self._tts.sample_rate, self._tts.num_channels
             )
+            # name goes to create_audio_track() — NOT to TrackPublishOptions,
+            # which has no "name" field and will raise a proto error if set.
             self._track = rtc.LocalAudioTrack.create_audio_track(
                 self.track_name, self._audio_source
             )
             options = rtc.TrackPublishOptions(
-                source=rtc.TrackSource.SOURCE_UNKNOWN, name=self.track_name
+                source=rtc.TrackSource.SOURCE_UNKNOWN,
             )
 
             try:
@@ -51,9 +52,12 @@ class TTSNode:
         while retries < 5 and self._running:
             try:
                 logger.debug(f"[TTSNode] Synthesising: {text[:30]}...")
-                async for event in self._tts.synthesize(text):
-                    if event.type == tts.SynthesizeEventType.AUDIO:
-                        await self._audio_source.capture_frame(event.frame)
+                # Current livekit-agents TTS.synthesize() yields SynthesizedAudio
+                # objects directly (with a .frame attribute) — not wrapped
+                # events with a .type field. Iterate and capture frames as-is.
+                async for synthesized_audio in self._tts.synthesize(text):
+                    if synthesized_audio.frame is not None:
+                        await self._audio_source.capture_frame(synthesized_audio.frame)
                 break
             except Exception as e:
                 retries += 1
