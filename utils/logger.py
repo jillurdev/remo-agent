@@ -61,6 +61,11 @@ def setup_logger():
             ch.setFormatter(PrettyFormatter())
         logger.addHandler(ch)
 
+    # Stop records from bubbling up to the root logger. LiveKit's worker/CLI
+    # configures its own root-level handler, so without this every log line
+    # gets emitted twice: once by our handler above, once again by root's.
+    logger.propagate = False
+
     return logger
 
 

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+import uuid
 from livekit import rtc
 from utils.logger import logger
 from .language_pipeline import LanguagePipeline
@@ -15,6 +16,14 @@ class SpeakerPipeline:
     transcript is published exactly once, in the speaker's own language.
     """
 
+    # If two FINAL segments arrive within this many seconds, we treat them
+    # as the same continuous sentence/turn (Deepgram often finalizes on a
+    # brief pause mid-sentence, not just at the true end of an utterance).
+    # Keeping the same turn id + growing the text lets the frontend replace
+    # the previous bubble instead of adding a new one — fixing the
+    # "sentence shows up broken into 2-3 messages" issue.
+    _TURN_GAP_SECONDS = 2.0
+
     def __init__(self, speaker: rtc.RemoteParticipant, room: rtc.Room):
         self.speaker = speaker
         self.room = room
@@ -24,6 +33,11 @@ class SpeakerPipeline:
 
         self._last_sent_segment = ""
         self._last_final_segment = None
+
+        # Turn-accumulation state
+        self._current_turn_id = None
+        self._current_turn_text = ""
+        self._last_final_at = 0.0
 
     async def set_speaker_track(self, track: rtc.AudioTrack):
         if self.speaker_track == track:
@@ -61,10 +75,29 @@ class SpeakerPipeline:
                 return
             self._last_sent_segment = text
 
-        # Publish the transcript for both interim and final — this drives the
-        # live caption UI and benefits from low latency updates as the
-        # speaker talks.
-        await self._publish_transcript(text, is_final)
+        # Decide whether this final continues the current turn or starts a
+        # new one, and publish the accumulated turn text (not just this
+        # fragment) so the frontend can overwrite a single growing bubble.
+        if is_final:
+            now = time.time()
+            starts_new_turn = (
+                self._current_turn_id is None
+                or (now - self._last_final_at) > self._TURN_GAP_SECONDS
+            )
+            if starts_new_turn:
+                self._current_turn_id = str(uuid.uuid4())
+                self._current_turn_text = text
+            else:
+                self._current_turn_text = f"{self._current_turn_text} {text}".strip()
+            self._last_final_at = now
+
+            await self._publish_transcript(
+                self._current_turn_text, is_final, self._current_turn_id
+            )
+        else:
+            # Interim path kept for safety in case STTNode ever emits one
+            # again; not expected to fire since STTNode only forwards finals.
+            await self._publish_transcript(text, is_final, self._current_turn_id)
 
         # Only fan FINAL segments out to translation + TTS. Forwarding
         # interim segments here caused each partial ("ami", "ami jacchi",
@@ -76,9 +109,10 @@ class SpeakerPipeline:
                 if pl:
                     asyncio.create_task(pl.handle_segment(text, is_final))
 
-    async def _publish_transcript(self, text: str, is_final: bool):
+    async def _publish_transcript(self, text: str, is_final: bool, turn_id: str):
         payload = {
             "type": "transcript",
+            "id": turn_id,
             "from": {"identity": self.speaker.identity},
             "speakerId": self.speaker.identity,
             "message": text,

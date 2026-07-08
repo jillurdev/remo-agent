@@ -59,11 +59,14 @@ class STTNode:
                     if not self._running:
                         break
 
-                    if event.type == stt.SpeechEventType.INTERIM_TRANSCRIPT:
-                        text = event.alternatives[0].text if event.alternatives else ""
-                        if text.strip():
-                            await self._on_segment(text, False)
-                    elif event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    # Only forward FINAL transcripts downstream. Interim
+                    # transcripts are noisy/partial ("ami", "ami jacchi",
+                    # "ami jacchi bazar-e") and the frontend renders each
+                    # one as a separate bubble instead of overwriting a
+                    # single "live" line — that's what was causing the
+                    # duplicated / broken-up sentences in the UI. Simplest
+                    # fix: stop emitting interim segments at the source.
+                    if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
                         text = event.alternatives[0].text if event.alternatives else ""
                         if text.strip():
                             await self._on_segment(text, True)

@@ -1,4 +1,3 @@
-
 import re
 from livekit import rtc
 from utils.logger import logger
@@ -61,4 +60,3 @@ class LanguagePipeline:
         logger.info(
             f"[LanguagePipeline] Stopped {self.target_lang} for {self.speaker.identity}"
         )
- 
